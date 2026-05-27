@@ -25,6 +25,9 @@ const LAST_UPDATE_ID_FILE = join(SUPERBOT_DIR, 'telegram-last-update-id.txt')
 const SENT_ESCALATIONS_FILE = join(SUPERBOT_DIR, 'telegram-sent-escalations.json')
 const MESSAGE_MAP_FILE = join(SUPERBOT_DIR, 'telegram-message-map.json')
 const HEARTBEAT_FILE = join(SUPERBOT_DIR, 'telegram-heartbeat.txt')
+// Outbound liveness: written at the end of every checkForReplies cycle so the
+// watchdog can detect a stalled outbound relay independently of the inbound loop.
+const OUTBOUND_HEARTBEAT_FILE = join(SUPERBOT_DIR, 'telegram-outbound-heartbeat.txt')
 const ESCALATIONS_DIR = join(SUPERBOT_DIR, 'escalations', 'needs_human')
 const SUPERBOT2_NAME = process.env.SUPERBOT2_NAME || 'superbot2'
 const TEAM_INBOXES_DIR = join(SUPERBOT_DIR, '.claude', 'teams', SUPERBOT2_NAME, 'inboxes')
@@ -45,6 +48,10 @@ let sentEscalationIds = new Set()
 let typingInterval = null
 let waitingForReply = false
 let shuttingDown = false
+// Re-entrancy guard: checkForReplies is driven by setInterval, which does NOT wait
+// for the previous (async) invocation to finish. If a send is slow, invocations would
+// stack and double-send the same reply. This flag ensures only one cycle runs at a time.
+let replyCheckRunning = false
 
 // Baseline index: when user sends a message via Telegram, we record the current
 // inbox length so we only forward replies that arrived after that point.
@@ -188,17 +195,26 @@ async function downloadTelegramFile(fileId) {
 
 const MAX_RETRIES = 3
 const RETRY_BACKOFF = [1000, 2000, 4000] // exponential backoff
+// Per-request timeout for ALL Telegram API calls. Without this, a half-open /
+// black-holed TCP connection makes fetch() hang forever — which is exactly what
+// silently wedged the outbound relay loop on 2026-05-27 (see knowledge/telegram-outbound-stall.md).
+// A timeout turns an indefinite hang into a retryable error so the loop can advance.
+const TG_REQUEST_TIMEOUT_MS = Number(process.env.TG_REQUEST_TIMEOUT_MS) || 20000
 
 function isRetryableError(err) {
   const msg = (err.message || '').toLowerCase()
-  return msg.includes('econnreset') ||
+  const name = (err.name || '').toLowerCase()
+  return name === 'timeouterror' ||
+    name === 'aborterror' ||
+    msg.includes('econnreset') ||
     msg.includes('etimedout') ||
     msg.includes('enotfound') ||
     msg.includes('econnrefused') ||
     msg.includes('fetch failed') ||
     msg.includes('network') ||
     msg.includes('socket hang up') ||
-    msg.includes('aborted')
+    msg.includes('aborted') ||
+    msg.includes('timeout')
 }
 
 async function tg(method, body) {
@@ -210,7 +226,7 @@ async function tg(method, body) {
   }
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      const res = await fetch(url, opts)
+      const res = await fetch(url, { ...opts, signal: AbortSignal.timeout(TG_REQUEST_TIMEOUT_MS) })
       const json = await res.json()
       if (!json.ok) {
         throw new Error(`Telegram API ${method} failed: ${json.description || 'unknown error'}`)
@@ -226,6 +242,10 @@ async function tg(method, body) {
       throw err
     }
   }
+  // Defensive backstop: never fall off the end and return undefined (a silent
+  // "sent with no message_id" would advance the outbound counter and DROP a
+  // message — exactly the silent-loss failure mode this hardening fights).
+  throw new Error(`tg(${method}) exhausted retries without a result`)
 }
 
 async function tgMultipart(method, fields, files) {
@@ -266,6 +286,8 @@ async function tgMultipart(method, fields, files) {
           'Content-Length': String(body.length),
         },
         body,
+        // Larger timeout for uploads (photos/documents can be big), still bounded.
+        signal: AbortSignal.timeout(TG_REQUEST_TIMEOUT_MS * 3),
       })
       const json = await res.json()
       if (!json.ok) {
@@ -282,6 +304,8 @@ async function tgMultipart(method, fields, files) {
       throw err
     }
   }
+  // Defensive backstop — see tg().
+  throw new Error(`tgMultipart(${method}) exhausted retries without a result`)
 }
 
 async function sendPhoto(filePath, caption, replyToMessageId) {
@@ -1233,8 +1257,23 @@ async function sendNewTextReply(html, plainText, replyToId) {
   }
 }
 
+async function writeOutboundHeartbeat() {
+  // Proves the outbound relay loop is alive, independent of the inbound poll loop.
+  // The watchdog watches this file; staleness => the loop wedged => restart.
+  await writeFile(OUTBOUND_HEARTBEAT_FILE, String(Date.now()), 'utf-8').catch(() => {})
+}
+
 async function checkForReplies() {
-  if (!chatId) return
+  // Re-entrancy guard: never let two cycles overlap (setInterval doesn't await).
+  if (replyCheckRunning) return
+  replyCheckRunning = true
+
+  if (!chatId) {
+    // Loop is alive even without a chatId — record liveness and bail.
+    replyCheckRunning = false
+    await writeOutboundHeartbeat()
+    return
+  }
 
   try {
     const dashUserInbox = await readJsonFile(join(TEAM_INBOXES_DIR, 'dashboard-user.json')) || []
@@ -1261,6 +1300,7 @@ async function checkForReplies() {
     const newReplies = orchestratorReplies.slice(startIdx)
 
     for (const reply of newReplies) {
+     try {
       const text = reply.text || reply.content || ''
       if (!text.trim()) continue
 
@@ -1384,6 +1424,11 @@ async function checkForReplies() {
       if (sentResult?.message_id) {
         messageMap[String(replyIdx)] = sentResult.message_id
       }
+     } catch (replyErr) {
+       // One malformed/failed reply must not wedge the whole batch. Log and move on;
+       // the counter still advances at the end so we don't re-process it forever.
+       logError(`Error processing one outbound reply: ${replyErr.message}`)
+     }
     }
 
     // Smart typing: if any reply mentions spawning a worker/background task,
@@ -1398,6 +1443,12 @@ async function checkForReplies() {
     await saveMessageMap()
   } catch (err) {
     logError(`Error checking for replies: ${err.message}`)
+  } finally {
+    // Always record outbound liveness, even on error — completing a cycle (success
+    // or handled error) proves the loop is alive. Only an indefinite hang would
+    // skip this, which is exactly what the watchdog's outbound-staleness check catches.
+    await writeOutboundHeartbeat()
+    replyCheckRunning = false
   }
 }
 
