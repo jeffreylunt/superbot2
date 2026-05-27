@@ -29,11 +29,30 @@ HEARTBEAT_STALE_THRESHOLD="${TELEGRAM_HEARTBEAT_STALE_THRESHOLD:-300}" # inbound
 OUTBOUND_STALE_THRESHOLD="${TELEGRAM_OUTBOUND_STALE_THRESHOLD:-180}"   # outbound stale = 3 min
 MAX_BACKOFF="${TELEGRAM_MAX_BACKOFF:-60}"
 STABLE_THRESHOLD="${TELEGRAM_STABLE_THRESHOLD:-60}"  # seconds of uptime before resetting backoff
+KILL_GRACE="${TELEGRAM_KILL_GRACE:-12}"  # seconds to allow the watcher's graceful outbound flush before SIGKILL
 
 mkdir -p "$LOG_DIR"
 
 log() {
   echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] telegram-watchdog: $1" >> "$LOG_FILE"
+}
+
+# Stop the watcher gracefully: SIGTERM (lets it flush pending outbound messages),
+# wait up to KILL_GRACE seconds, then SIGKILL as a backstop if it's wedged. Reaps the child.
+kill_watcher() {
+  local pid="$1"
+  [ -n "$pid" ] || return 0
+  kill "$pid" 2>/dev/null
+  local waited=0
+  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$KILL_GRACE" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    log "watcher (pid=$pid) still alive after ${KILL_GRACE}s graceful period — sending SIGKILL"
+    kill -9 "$pid" 2>/dev/null
+  fi
+  wait "$pid" 2>/dev/null
 }
 
 # Returns 0 (true) if telegram is enabled in config.json. Conservative: if the
@@ -76,10 +95,9 @@ echo $$ > "$WATCHDOG_PID_FILE"
 
 cleanup() {
   log "shutting down"
-  # Kill the watcher child if running
+  # Kill the watcher child if running (graceful flush, then SIGKILL backstop)
   if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
-    kill "$CHILD_PID" 2>/dev/null
-    wait "$CHILD_PID" 2>/dev/null
+    kill_watcher "$CHILD_PID"
   fi
   rm -f "$WATCHDOG_PID_FILE"
   exit 0
@@ -120,8 +138,7 @@ while true; do
     INBOUND_AGE=$(heartbeat_age_s "$HEARTBEAT_FILE")
     if [ -n "$INBOUND_AGE" ] && [ "$INBOUND_AGE" -gt "$HEARTBEAT_STALE_THRESHOLD" ]; then
       log "INBOUND heartbeat stale (${INBOUND_AGE}s > ${HEARTBEAT_STALE_THRESHOLD}s) — killing watcher to restart"
-      kill "$CHILD_PID" 2>/dev/null
-      wait "$CHILD_PID" 2>/dev/null
+      kill_watcher "$CHILD_PID"
       EXIT_CODE=1
       CHILD_PID=""
       rm -f "$HEARTBEAT_FILE"
@@ -133,8 +150,7 @@ while true; do
     OUTBOUND_AGE=$(heartbeat_age_s "$OUTBOUND_HEARTBEAT_FILE")
     if [ -n "$OUTBOUND_AGE" ] && [ "$OUTBOUND_AGE" -gt "$OUTBOUND_STALE_THRESHOLD" ]; then
       log "!!! OUTBOUND relay STALLED: heartbeat stale (${OUTBOUND_AGE}s > ${OUTBOUND_STALE_THRESHOLD}s) while process alive — killing watcher to self-heal"
-      kill "$CHILD_PID" 2>/dev/null
-      wait "$CHILD_PID" 2>/dev/null
+      kill_watcher "$CHILD_PID"
       EXIT_CODE=1
       CHILD_PID=""
       rm -f "$OUTBOUND_HEARTBEAT_FILE"

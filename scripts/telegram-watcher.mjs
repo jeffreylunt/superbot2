@@ -32,11 +32,15 @@ const ESCALATIONS_DIR = join(SUPERBOT_DIR, 'escalations', 'needs_human')
 const SUPERBOT2_NAME = process.env.SUPERBOT2_NAME || 'superbot2'
 const TEAM_INBOXES_DIR = join(SUPERBOT_DIR, '.claude', 'teams', SUPERBOT2_NAME, 'inboxes')
 const DASHBOARD_API = `http://localhost:${process.env.SUPERBOT2_API_PORT || '3274'}/api`
-const TELEGRAM_API = 'https://api.telegram.org/bot'
+// Override the API base in tests to point at a mock server (default: real Telegram).
+const TELEGRAM_API = process.env.TELEGRAM_API_BASE || 'https://api.telegram.org/bot'
 const POLL_TIMEOUT = 30
 const TYPING_INTERVAL = 3000
-const REPLY_POLL_INTERVAL = 3000
+const REPLY_POLL_INTERVAL = Number(process.env.TG_REPLY_POLL_INTERVAL) || 3000
 const ESCALATION_POLL_INTERVAL = 10000
+// On shutdown, drain pending outbound messages before exiting (graceful restart).
+// Bounded so a wedged loop can't make shutdown hang; the watchdog SIGKILLs as a backstop.
+const GRACEFUL_FLUSH_TIMEOUT_MS = Number(process.env.TG_GRACEFUL_FLUSH_TIMEOUT_MS) || 8000
 
 // --- State ---
 
@@ -1300,12 +1304,20 @@ async function checkForReplies() {
     const newReplies = orchestratorReplies.slice(startIdx)
 
     for (const reply of newReplies) {
+     // Track the inbox index for this reply (for future reverse-mapping)
+     const replyIdx = startIdx + newReplies.indexOf(reply)
+     // delivered: true only when this reply was actually relayed (or had nothing
+     // to relay). We advance + persist the counter PER reply on success, and BREAK
+     // on a delivery failure, so the next cycle — or a fresh instance after a
+     // restart — resumes from exactly this reply. Nothing is ever skipped/dropped.
+     let delivered = false
+     let editSucceeded = false
+     let overflowOk = true // caption-overflow trailing text (image branch) delivered?
      try {
       const text = reply.text || reply.content || ''
-      if (!text.trim()) continue
-
-      // Track the inbox index for this reply (for future reverse-mapping)
-      const replyIdx = startIdx + newReplies.indexOf(reply)
+      if (!text.trim()) {
+        delivered = true // nothing to send — count as handled
+      } else {
 
       // Find the correct user message to thread this reply to.
       // Walk anchors to find the one with the highest inboxCountAtSend that
@@ -1356,7 +1368,9 @@ async function checkForReplies() {
             log(`Sent ${batch.length} photos as album to Telegram`)
           }
 
-          // If caption was truncated and there's significant remaining text, send the rest as a message
+          // If caption was truncated and there's significant remaining text, send the rest as a message.
+          // Track its delivery: if the trailing chunk can't be sent, mark the whole reply
+          // undelivered so it's retried (no silently-dropped text).
           if (textWithoutImages.length > 1024) {
             const remaining = textWithoutImages.slice(1024)
             const truncated = remaining.length > 4000 ? remaining.slice(0, 3997) + '...' : remaining
@@ -1364,7 +1378,12 @@ async function checkForReplies() {
             try {
               await tg('sendMessage', { chat_id: chatId, text: html, parse_mode: 'HTML' })
             } catch {
-              await tg('sendMessage', { chat_id: chatId, text: truncated }).catch(() => {})
+              try {
+                await tg('sendMessage', { chat_id: chatId, text: truncated })
+              } catch {
+                overflowOk = false
+                logError('Caption-overflow text failed to send — reply will be retried')
+              }
             }
           }
         } catch (err) {
@@ -1409,6 +1428,7 @@ async function checkForReplies() {
             lastSentBotMessageText = combinedTruncated
             lastSentBotMessageTime = now
             // sentResult stays null — we reuse the existing message_id
+            editSucceeded = true // delivered via edit, even though sentResult is null
             log(`Edited previous message to append reply`)
           } catch (editErr) {
             logError(`Failed to edit message, sending new: ${editErr.message}`)
@@ -1420,14 +1440,35 @@ async function checkForReplies() {
         }
       }
 
+      // sendMediaGroup returns an ARRAY of messages; normalize to the first for the map.
+      const sentMsg = Array.isArray(sentResult) ? sentResult[0] : sentResult
       // Track the sent message ID so we can map it when user replies to it
-      if (sentResult?.message_id) {
-        messageMap[String(replyIdx)] = sentResult.message_id
+      if (sentMsg?.message_id) {
+        messageMap[String(replyIdx)] = sentMsg.message_id
       }
+      // Delivered only if the primary send succeeded AND any caption-overflow text
+      // also went through (or it was an edit-coalesce).
+      delivered = (!!sentResult && overflowOk) || editSucceeded
+      } // end else (non-empty text)
      } catch (replyErr) {
-       // One malformed/failed reply must not wedge the whole batch. Log and move on;
-       // the counter still advances at the end so we don't re-process it forever.
-       logError(`Error processing one outbound reply: ${replyErr.message}`)
+       // A THROWN error here is a logic/data problem, not a transient send failure
+       // (sends have their own retry+fallback and return null instead of throwing).
+       // Skip it so a single poison message can't wedge the loop forever.
+       logError(`Error processing outbound reply idx ${replyIdx} — skipping: ${replyErr.message}`)
+       delivered = true
+     }
+
+     if (delivered) {
+       // Advance + persist immediately so the counter always reflects exactly what
+       // has been relayed. A crash/kill/restart here resumes from the right offset.
+       lastSentReplyCount = replyIdx + 1
+       await saveLastSentCount(lastSentReplyCount)
+     } else {
+       // Transient delivery failure (network / Telegram down). Stop the batch and
+       // retry from this exact reply next cycle — never advance past an undelivered
+       // message, so a restart/handoff can't silently drop it.
+       logError(`Outbound delivery failed for reply idx ${replyIdx} — will retry next cycle (no drop)`)
+       break
      }
     }
 
@@ -1438,8 +1479,6 @@ async function checkForReplies() {
     if (anyBackgroundWork) {
       waitingForReply = false
     }
-    lastSentReplyCount = orchestratorReplies.length
-    await saveLastSentCount(lastSentReplyCount)
     await saveMessageMap()
   } catch (err) {
     logError(`Error checking for replies: ${err.message}`)
@@ -1802,12 +1841,30 @@ async function main() {
 
 // --- Shutdown ---
 
+async function flushOutbound() {
+  // Final drain before exit: relay any pending dashboard-user replies so a planned
+  // restart (manual / watchdog / self-heal) doesn't leave a message un-sent. Safe to
+  // call mid-cycle — we wait briefly for the re-entrancy guard to clear, then run one
+  // last cycle. Combined with per-reply counter persistence, this means a restart
+  // never silently drops a dashboard-user -> Telegram message.
+  for (let i = 0; i < 50 && replyCheckRunning; i++) await sleep(100)
+  await checkForReplies()
+}
+
 async function shutdown(signal) {
   if (shuttingDown) return
   shuttingDown = true
-  log(`Shutting down (${signal})...`)
+  log(`Shutting down (${signal})... flushing pending outbound first`)
   stopTyping()
   stopBackgroundLoops()
+  try {
+    await Promise.race([
+      flushOutbound(),
+      sleep(GRACEFUL_FLUSH_TIMEOUT_MS).then(() => log('Outbound flush timed out — exiting anyway')),
+    ])
+  } catch (err) {
+    logError(`Outbound flush error during shutdown: ${err.message}`)
+  }
   await removePidFile()
   process.exit(0)
 }
