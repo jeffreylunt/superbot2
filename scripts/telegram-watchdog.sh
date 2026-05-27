@@ -24,7 +24,7 @@ HEARTBEAT_FILE="$SUPERBOT_DIR/telegram-heartbeat.txt"
 OUTBOUND_HEARTBEAT_FILE="$SUPERBOT_DIR/telegram-outbound-heartbeat.txt"
 LOG_DIR="$SUPERBOT_DIR/logs"
 LOG_FILE="$LOG_DIR/telegram-watcher.log"
-HEALTH_CHECK_INTERVAL="${TELEGRAM_HEALTH_CHECK_INTERVAL:-60}"        # check heartbeats every 60s
+HEALTH_CHECK_INTERVAL="${TELEGRAM_HEALTH_CHECK_INTERVAL:-15}"        # poll child + heartbeats every 15s (fast crash/stall recovery)
 HEARTBEAT_STALE_THRESHOLD="${TELEGRAM_HEARTBEAT_STALE_THRESHOLD:-300}" # inbound stale = 5 min
 OUTBOUND_STALE_THRESHOLD="${TELEGRAM_OUTBOUND_STALE_THRESHOLD:-180}"   # outbound stale = 3 min
 MAX_BACKOFF="${TELEGRAM_MAX_BACKOFF:-60}"
