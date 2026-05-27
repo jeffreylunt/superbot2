@@ -60,6 +60,17 @@ heartbeat_age_s() {
   echo $(((now_ms - ts) / 1000))
 }
 
+# Singleton guard: refuse to start if another watchdog is already running.
+# Two watchdogs would each try to (re)launch the watcher and fight over the
+# watcher PID file, causing restart churn. Mirrors the watcher's own check.
+if [ -f "$WATCHDOG_PID_FILE" ]; then
+  EXISTING_PID="$(cat "$WATCHDOG_PID_FILE" 2>/dev/null)"
+  if [ -n "$EXISTING_PID" ] && [ "$EXISTING_PID" != "$$" ] && kill -0 "$EXISTING_PID" 2>/dev/null; then
+    log "another watchdog already running (pid=$EXISTING_PID) — exiting"
+    exit 0
+  fi
+fi
+
 # Write watchdog PID
 echo $$ > "$WATCHDOG_PID_FILE"
 
