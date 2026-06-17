@@ -121,6 +121,16 @@ while true; do
 
   log "launching watcher (backoff=${BACKOFF}s)"
 
+  # The watcher auto-detects the ACTIVE team inbox (orchestrator now runs under a
+  # session-named team, not 'superbot2'). A stale SUPERBOT2_NAME=superbot2 inherited
+  # from an old launch context would pin it to the now-dead legacy team and break
+  # outbound relay. Clear that specific stale value so auto-detection runs. A genuine,
+  # deliberate override to some OTHER team name is preserved.
+  if [ "${SUPERBOT2_NAME:-}" = "superbot2" ]; then
+    log "clearing stale SUPERBOT2_NAME=superbot2 so watcher auto-detects active team inbox"
+    unset SUPERBOT2_NAME
+  fi
+
   node "$WATCHER_SCRIPT" >> "$LOG_FILE" 2>&1 &
   CHILD_PID=$!
 

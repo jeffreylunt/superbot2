@@ -10,7 +10,7 @@
 // Handles /status, /escalations, /recent, /schedule, /todo, /help commands
 // Typing indicator while waiting for orchestrator reply
 
-import { readFile, writeFile, readdir, unlink, stat, mkdir } from 'node:fs/promises'
+import { readFile, writeFile, readdir, unlink, stat, lstat, mkdir } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { join, basename, extname } from 'node:path'
 import { homedir } from 'node:os'
@@ -29,8 +29,21 @@ const HEARTBEAT_FILE = join(SUPERBOT_DIR, 'telegram-heartbeat.txt')
 // watchdog can detect a stalled outbound relay independently of the inbound loop.
 const OUTBOUND_HEARTBEAT_FILE = join(SUPERBOT_DIR, 'telegram-outbound-heartbeat.txt')
 const ESCALATIONS_DIR = join(SUPERBOT_DIR, 'escalations', 'needs_human')
-const SUPERBOT2_NAME = process.env.SUPERBOT2_NAME || 'superbot2'
-const TEAM_INBOXES_DIR = join(SUPERBOT_DIR, '.claude', 'teams', SUPERBOT2_NAME, 'inboxes')
+// Team name is NO LONGER hardcoded to 'superbot2'. The orchestrator registers under
+// a SESSION-based team name (e.g. 'session-475577c1') because TeamCreate is unavailable
+// in the current harness, so its outbound replies land in
+//   .claude/teams/<session-name>/inboxes/dashboard-user.json
+// which changes across orchestrator restarts. We auto-detect the ACTIVE team inbox each
+// poll cycle (most-recently-modified dashboard-user.json) instead of a fixed name.
+// SUPERBOT2_NAME, if explicitly set, forces a fixed team (back-compat / testing override).
+const SUPERBOT2_NAME = process.env.SUPERBOT2_NAME || ''
+const TEAMS_DIR = join(SUPERBOT_DIR, '.claude', 'teams')
+// Legacy default used only as a last-resort fallback when no team inbox can be found.
+const LEGACY_TEAM_NAME = 'superbot2'
+// Resolved at runtime (see refreshActiveInbox). Re-resolved every poll cycle.
+let TEAM_INBOXES_DIR = SUPERBOT2_NAME
+  ? join(TEAMS_DIR, SUPERBOT2_NAME, 'inboxes')
+  : join(TEAMS_DIR, LEGACY_TEAM_NAME, 'inboxes')
 const DASHBOARD_API = `http://localhost:${process.env.SUPERBOT2_API_PORT || '3274'}/api`
 // Override the API base in tests to point at a mock server (default: real Telegram).
 const TELEGRAM_API = process.env.TELEGRAM_API_BASE || 'https://api.telegram.org/bot'
@@ -38,6 +51,12 @@ const POLL_TIMEOUT = 30
 const TYPING_INTERVAL = 3000
 const REPLY_POLL_INTERVAL = Number(process.env.TG_REPLY_POLL_INTERVAL) || 3000
 const ESCALATION_POLL_INTERVAL = 10000
+// Active-inbox switch hysteresis: when two team inboxes briefly look "active" (e.g. a
+// restart/handoff overlap), a naive most-recent-mtime pick can FLIP between them, and each
+// flip resets the counter to 0 and re-forwards the whole inbox → duplicate Telegram blasts.
+// We only switch away from the current inbox if a DIFFERENT one is newer than our current
+// inbox's LIVE mtime by at least this margin. While our inbox is still being written, it wins.
+const INBOX_SWITCH_HYSTERESIS_MS = Number(process.env.TG_INBOX_SWITCH_HYSTERESIS_MS) || 15000
 // On shutdown, drain pending outbound messages before exiting (graceful restart).
 // Bounded so a wedged loop can't make shutdown hang; the watchdog SIGKILLs as a backstop.
 const GRACEFUL_FLUSH_TIMEOUT_MS = Number(process.env.TG_GRACEFUL_FLUSH_TIMEOUT_MS) || 8000
@@ -48,6 +67,14 @@ let botToken = ''
 let chatId = ''
 let lastUpdateId = -1 // -1 means "not loaded yet, skip old updates on first run"
 let lastSentReplyCount = 0
+// Whether refreshActiveInbox has locked onto a real inbox at least once. Used so the
+// FIRST resolution (at startup) doesn't trigger the switch-reset, but later switches do.
+let activeInboxResolved = false
+// The dashboard-user.json mtime of the inbox we're CURRENTLY locked onto, captured when we
+// locked on. Used for switch hysteresis: we only flip to a different team's inbox if that
+// inbox is strictly newer than our current inbox's LIVE mtime by INBOX_SWITCH_HYSTERESIS_MS.
+// While our current inbox is still being appended to (active session), nothing can steal it.
+let activeInboxDashMtime = 0
 let sentEscalationIds = new Set()
 let typingInterval = null
 let waitingForReply = false
@@ -124,6 +151,134 @@ async function saveConfigField(field, value) {
   if (!config.telegram) config.telegram = {}
   config.telegram[field] = value
   await writeJsonFile(CONFIG_PATH, config)
+}
+
+// --- Active team inbox resolution ---
+
+// Return the mtime (ms) of a real file, or null if it doesn't exist / isn't a
+// regular file. SYMLINKS are deliberately rejected: a stale band-aid symlink (or a
+// self-referential one) must never be chosen as the active inbox.
+async function fileMtimeMs(filePath) {
+  try {
+    const st = await lstat(filePath)
+    if (st.isSymbolicLink() || !st.isFile()) return null
+    return st.mtimeMs
+  } catch {
+    return null
+  }
+}
+
+// Find the candidate active team inbox: the most-recently-modified real (non-symlink)
+// dashboard-user.json across teams/*. Selection is by dashboard-user.json mtime ALONE —
+// team-lead.json mtime is deliberately NOT a selection signal (an inbound relay merely
+// touching team-lead.json must never change which inbox we forward FROM; that was an
+// oscillation vector). team-lead.json mtime only breaks exact dashMtime ties (rare), to
+// keep the choice deterministic. Returns { inboxesDir, dashMtime } or null if none found.
+async function findCandidateInbox() {
+  let teamDirs = []
+  try {
+    teamDirs = await readdir(TEAMS_DIR)
+  } catch {
+    return null
+  }
+
+  let best = null // { inboxesDir, dashMtime, leadMtime }
+  for (const team of teamDirs) {
+    const inboxesDir = join(TEAMS_DIR, team, 'inboxes')
+    const dashMtime = await fileMtimeMs(join(inboxesDir, 'dashboard-user.json'))
+    if (dashMtime === null) continue // no real dashboard-user.json here (or it's a symlink)
+    const leadMtime = (await fileMtimeMs(join(inboxesDir, 'team-lead.json'))) ?? 0
+    const isBetter =
+      !best ||
+      dashMtime > best.dashMtime ||
+      (dashMtime === best.dashMtime && leadMtime > best.leadMtime)
+    if (isBetter) best = { inboxesDir, dashMtime, leadMtime }
+  }
+  return best ? { inboxesDir: best.inboxesDir, dashMtime: best.dashMtime } : null
+}
+
+// Resolve the inboxes dir when SUPERBOT2_NAME pins a fixed team, or as a last-resort
+// fallback. Returns just the path.
+function fixedOrFallbackInboxesDir() {
+  if (SUPERBOT2_NAME) return join(TEAMS_DIR, SUPERBOT2_NAME, 'inboxes')
+  return join(TEAMS_DIR, LEGACY_TEAM_NAME, 'inboxes')
+}
+
+// Re-resolve the active inbox and update TEAM_INBOXES_DIR. When the active inbox PATH
+// changes (orchestrator restarted under a new session/team name), the new
+// dashboard-user.json is a DIFFERENT, fresh inbox — our lastSentReplyCount no longer
+// refers to its messages. We reset the counter to 0 ONCE on switch so we don't skip the
+// new inbox's content AND don't treat old indices as already-sent. This mirrors the
+// existing "inbox truncated -> new session" behavior (forward the new inbox once); the
+// per-reply counter persistence then prevents any re-send on subsequent cycles.
+//
+// SWITCH HYSTERESIS (anti-oscillation): during a restart/handoff overlap two team inboxes
+// can briefly both look recent. A naive most-recent pick would FLIP between them, and each
+// flip re-blasts the whole inbox to Telegram (duplicate messages to the user). So once
+// we're locked onto an inbox we only switch AWAY if a DIFFERENT inbox's dashMtime exceeds
+// our CURRENT inbox's LIVE dashMtime by INBOX_SWITCH_HYSTERESIS_MS. While our inbox is
+// still being appended to (the live session), it always wins and we never flip.
+async function refreshActiveInbox() {
+  // Pinned-team override / no-candidate fallback: behave like the old direct path, but
+  // still honor the first-resolution-doesn't-reset rule.
+  if (SUPERBOT2_NAME) {
+    return applyResolvedInbox(fixedOrFallbackInboxesDir(), null)
+  }
+
+  const candidate = await findCandidateInbox()
+  if (!candidate) {
+    return applyResolvedInbox(fixedOrFallbackInboxesDir(), null)
+  }
+
+  // Not yet locked onto anything → take the candidate as-is (startup).
+  if (!activeInboxResolved) {
+    return applyResolvedInbox(candidate.inboxesDir, candidate.dashMtime)
+  }
+
+  // Already on this inbox → just refresh its live mtime so hysteresis measures against
+  // the CURRENT mtime (an actively-written inbox keeps raising the bar for challengers).
+  if (candidate.inboxesDir === TEAM_INBOXES_DIR) {
+    const liveMtime = await fileMtimeMs(join(TEAM_INBOXES_DIR, 'dashboard-user.json'))
+    if (liveMtime !== null) activeInboxDashMtime = liveMtime
+    return TEAM_INBOXES_DIR
+  }
+
+  // A DIFFERENT inbox is the candidate. Only switch if it's meaningfully newer than our
+  // current inbox's LIVE mtime — otherwise the current (still-active) session keeps it.
+  const currentLiveMtime =
+    (await fileMtimeMs(join(TEAM_INBOXES_DIR, 'dashboard-user.json'))) ?? activeInboxDashMtime
+  if (candidate.dashMtime > currentLiveMtime + INBOX_SWITCH_HYSTERESIS_MS) {
+    return applyResolvedInbox(candidate.inboxesDir, candidate.dashMtime)
+  }
+  // Hold — challenger isn't decisively newer; avoid an oscillating flip + re-blast.
+  return TEAM_INBOXES_DIR
+}
+
+// Apply a resolved inbox path, performing the one-time switch-reset when appropriate.
+// dashMtime may be null (pinned/fallback paths) — we look it up so hysteresis stays valid.
+async function applyResolvedInbox(resolved, dashMtime) {
+  if (resolved !== TEAM_INBOXES_DIR) {
+    const previous = TEAM_INBOXES_DIR
+    TEAM_INBOXES_DIR = resolved
+    // Only treat it as a "switch" (reset counter) if we'd previously locked onto a real
+    // inbox. On the very first resolution at startup, loadLastSentCount + the startup
+    // truncation check already establish the correct baseline, so don't clobber it here.
+    if (activeInboxResolved) {
+      // NOTE: on a switch we deliberately ABANDON any in-flight undelivered reply from the
+      // PRIOR session's inbox (resetting the counter to 0 here points us at the NEW inbox).
+      // That prior session is gone; its un-sent tail can't be meaningfully delivered to the
+      // user anymore. This is the one intentional exception to the otherwise-strict
+      // "never silently drop an outbound reply" guarantee in checkForReplies.
+      log(`Active team inbox switched: ${previous} -> ${resolved} — resetting outbound counter to 0`)
+      lastSentReplyCount = 0
+      replyBaseline = 0
+      await saveLastSentCount(lastSentReplyCount)
+    }
+  }
+  activeInboxResolved = true
+  const m = dashMtime ?? (await fileMtimeMs(join(TEAM_INBOXES_DIR, 'dashboard-user.json')))
+  if (m !== null && m !== undefined) activeInboxDashMtime = m
+  return TEAM_INBOXES_DIR
 }
 
 // --- Image path detection ---
@@ -983,7 +1138,10 @@ async function handleWorkersCommand() {
   await sendTypingAction()
 
   try {
-    const teamConfigPath = join(SUPERBOT_DIR, '.claude', 'teams', SUPERBOT2_NAME, 'config.json')
+    // Derive the team config from the active inbox dir (teams/<team>/inboxes ->
+    // teams/<team>/config.json) so /workers tracks the live session, not a fixed name.
+    await refreshActiveInbox()
+    const teamConfigPath = join(TEAM_INBOXES_DIR, '..', 'config.json')
     const teamConfig = await readJsonFile(teamConfigPath)
 
     if (!teamConfig?.members || teamConfig.members.length === 0) {
@@ -1280,6 +1438,12 @@ async function checkForReplies() {
   }
 
   try {
+    // Re-resolve the active team inbox each cycle so a mid-run orchestrator session
+    // change (new session-named team) is picked up without a restart. On a path SWITCH
+    // this resets the outbound counter to 0 (see refreshActiveInbox) so we forward the
+    // new inbox once and never double-send across the switch.
+    await refreshActiveInbox()
+
     const dashUserInbox = await readJsonFile(join(TEAM_INBOXES_DIR, 'dashboard-user.json')) || []
     const orchestratorReplies = dashUserInbox.filter(m => m.from === 'team-lead')
 
@@ -1764,6 +1928,13 @@ async function main() {
   lastSentReplyCount = await loadLastSentCount()
   sentEscalationIds = await loadSentEscalations()
   messageMap = await loadMessageMap()
+
+  // Resolve the active team inbox at startup (before the truncation sync below) so the
+  // counter sync runs against the inbox we'll actually read. This first resolution does
+  // NOT trigger the switch-reset (activeInboxResolved starts false) — the loaded
+  // lastSentReplyCount + the truncation check establish the correct baseline.
+  await refreshActiveInbox()
+  log(`Active team inbox resolved: ${TEAM_INBOXES_DIR}`)
 
   // Startup counter sync check — detect if inbox was truncated since last run.
   // Reset to 0 (not current length) because a truncated inbox means a new
