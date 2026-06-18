@@ -7,6 +7,7 @@ import { execFile, execFileSync, spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import yaml from 'js-yaml'
 import multer from 'multer'
+import { resolveActiveTeamInboxesDir as resolveActiveTeamInboxes } from './active-team-inbox.mjs'
 
 const app = express()
 const PORT = parseInt(process.env.SUPERBOT2_API_PORT || '3274', 10)
@@ -19,7 +20,17 @@ const SUPERBOT_SKILLS_DIR = join(import.meta.dirname, '..', 'skills')
 const KNOWLEDGE_DIR = join(SUPERBOT_DIR, 'knowledge')
 const SKILL_DATA_DIR = join(SUPERBOT_DIR, 'skill-data')
 const LEGACY_SKILL_SETTINGS_DIR = join(SUPERBOT_DIR, 'skill-settings')
-const TEAM_INBOXES_DIR = join(SUPERBOT_DIR, '.claude', 'teams', SUPERBOT2_NAME, 'inboxes')
+// NOTE: The orchestrator no longer always runs as team 'superbot2'. With TeamCreate
+// unavailable in the current harness, each orchestrator session registers under a
+// session-based team name (e.g. 'session-475577c1'), and its inbox is
+//   .claude/teams/<session>/inboxes/team-lead.json
+// Writing inbound user messages (Telegram relay, escalation-resolved, card actions) to a
+// hardcoded teams/superbot2/inboxes/team-lead.json sends them to a DEAD inbox the live
+// orchestrator never reads — they silently never reach it. So inbound delivery must target
+// the ACTIVE orchestrator team inbox, resolved dynamically at request time (see
+// resolveActiveTeamInboxesDir). This constant is now only a last-resort fallback default.
+const TEAMS_DIR = join(SUPERBOT_DIR, '.claude', 'teams')
+const TEAM_INBOXES_DIR = join(TEAMS_DIR, SUPERBOT2_NAME, 'inboxes')
 const MARKETPLACE_API_BASE = process.env.SUPERBOT2_MARKETPLACE_URL || 'https://superchargeclaudecode.com'
 
 app.use(express.json({ limit: '50mb' }))
@@ -42,6 +53,27 @@ async function readMarkdownFile(filePath) {
   } catch {
     return { content: '', exists: false }
   }
+}
+
+// Resolve the ACTIVE orchestrator team's inboxes directory (see active-team-inbox.mjs).
+// Resolved per-request so a mid-run orchestrator session change is picked up automatically.
+// SUPERBOT2_NAME other than the legacy 'superbot2' default pins a fixed team (back-compat).
+let _loggedActiveInbox = null
+async function resolveActiveTeamInboxesDir() {
+  const resolved = (await resolveActiveTeamInboxes(TEAMS_DIR, {
+    pinnedTeam: SUPERBOT2_NAME,
+    fallbackInboxesDir: TEAM_INBOXES_DIR,
+  })) || TEAM_INBOXES_DIR
+  if (resolved !== _loggedActiveInbox) {
+    console.log(`[messages] active orchestrator inbox -> ${resolved}`)
+    _loggedActiveInbox = resolved
+  }
+  return resolved
+}
+
+// Path to the active orchestrator's team-lead.json (where inbound user messages go).
+async function activeTeamLeadInboxPath() {
+  return join(await resolveActiveTeamInboxesDir(), 'team-lead.json')
 }
 
 async function safeReaddir(dirPath) {
@@ -633,9 +665,9 @@ app.patch('/api/escalations/:id', async (req, res) => {
       } catch { /* file may already be moved */ }
     }
 
-    // Notify orchestrator immediately via team-lead inbox
+    // Notify orchestrator immediately via team-lead inbox (ACTIVE team, resolved per-request)
     try {
-      const inboxPath = join(TEAM_INBOXES_DIR, 'team-lead.json')
+      const inboxPath = await activeTeamLeadInboxPath()
       const inbox = await readJsonFile(inboxPath) || []
       inbox.push({
         from: 'dashboard-user',
@@ -4591,7 +4623,7 @@ app.patch('/api/cards/:skillId/items/:itemId', async (req, res) => {
             if (key === 'dataPath') return filePath
             return String(updatedItem[key] ?? '')
           })
-          const inboxPath = join(TEAM_INBOXES_DIR, 'team-lead.json')
+          const inboxPath = await activeTeamLeadInboxPath()
           const inbox = await readJsonFile(inboxPath) || []
           inbox.push({
             from: 'dashboard-user',
@@ -5030,8 +5062,10 @@ app.get('/api/messages', async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit) || 50, 500)
     const before = req.query.before // ISO timestamp cursor for load-earlier
 
-    const teamLeadInbox = await readJsonFile(join(TEAM_INBOXES_DIR, 'team-lead.json')) || []
-    const dashUserInbox = await readJsonFile(join(TEAM_INBOXES_DIR, 'dashboard-user.json')) || []
+    // Render the ACTIVE orchestrator team's conversation (same inbox inbound is written to).
+    const activeInboxesDir = await resolveActiveTeamInboxesDir()
+    const teamLeadInbox = await readJsonFile(join(activeInboxesDir, 'team-lead.json')) || []
+    const dashUserInbox = await readJsonFile(join(activeInboxesDir, 'dashboard-user.json')) || []
 
     // User messages sent from dashboard
     const userMessages = teamLeadInbox.filter(m => m.from === 'dashboard-user')
@@ -5067,11 +5101,11 @@ app.get('/api/messages', async (req, res) => {
     // Background: everything from team-lead inbox + orchestrator outbound to all workers
     const bgFromInbox = teamLeadInbox.filter(m => m.from !== 'dashboard-user')
 
-    const files = await readdir(TEAM_INBOXES_DIR)
+    const files = await readdir(activeInboxesDir)
     const workerFiles = files.filter(f => f.endsWith('.json') && f !== 'team-lead.json' && f !== 'dashboard-user.json')
     const outboundArrays = await Promise.all(workerFiles.map(async (file) => {
       try {
-        const msgs = await readJsonFile(join(TEAM_INBOXES_DIR, file)) || []
+        const msgs = await readJsonFile(join(activeInboxesDir, file)) || []
         const workerName = file.replace('.json', '')
         return msgs.filter(m => m.from === 'team-lead').map(m => ({ ...m, to: workerName }))
       } catch { return [] }
@@ -5119,7 +5153,10 @@ app.post('/api/messages', async (req, res) => {
       messageText = messageText ? `${messageText}\n${pathsStr}` : pathsStr
     }
 
-    const inboxPath = join(TEAM_INBOXES_DIR, 'team-lead.json')
+    // Deliver to the ACTIVE orchestrator team inbox (resolved per-request) — NOT a
+    // hardcoded team. The orchestrator now runs under a session-named team; writing to the
+    // stale 'superbot2' inbox would silently never reach it (inbound relay outage).
+    const inboxPath = await activeTeamLeadInboxPath()
     const existing = await readJsonFile(inboxPath) || []
 
     existing.push({
