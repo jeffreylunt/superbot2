@@ -28,11 +28,41 @@ CLAUDE_DIR="$DIR/.claude"
 CONFIG="$DIR/config.json"
 LAST_RUN="$DIR/schedule-last-run.json"
 LOG="$DIR/logs/scheduler.log"
-TEAM_DIR="$CLAUDE_DIR/teams/$SUPERBOT2_NAME"
+TEAMS_DIR="$CLAUDE_DIR/teams"
 
-# Exit silently if no config or team not set up
+# Exit silently if no global config
 [[ ! -f "$CONFIG" ]] && exit 0
-[[ ! -f "$TEAM_DIR/config.json" ]] && exit 0
+
+# Resolve the ACTIVE orchestrator team dir. With TeamCreate unavailable in the current
+# harness, each orchestrator session registers under a session-based team name (e.g.
+# 'session-475577c1') instead of the fixed 'superbot2'. Hardcoding teams/superbot2 sends
+# scheduled_job messages to a dead inbox the live orchestrator never reads (silent outage)
+# — and the fixed 'superbot2' dir often has no config.json, so the old gate exited here
+# every run. Mirror dashboard/active-team-inbox.mjs: among teams with a REAL config.json,
+# pick the one whose activity (config.json / inbox files) is freshest. An explicit
+# SUPERBOT2_NAME other than the legacy 'superbot2' default forces that team.
+TEAM_DIR=$(node -e "
+const fs = require('fs'), path = require('path');
+const teamsDir = process.argv[1], pinned = process.argv[2];
+function realMtime(p) { try { const st = fs.lstatSync(p); if (st.isSymbolicLink() || !st.isFile()) return null; return st.mtimeMs; } catch { return null; } }
+if (pinned && pinned !== 'superbot2') { process.stdout.write(path.join(teamsDir, pinned)); process.exit(0); }
+let teams = [];
+try { teams = fs.readdirSync(teamsDir); } catch { process.exit(0); }
+let best = null;
+for (const t of teams) {
+  const dir = path.join(teamsDir, t);
+  const cfg = realMtime(path.join(dir, 'config.json'));
+  if (cfg === null) continue; // not a live/registered orchestrator team
+  const dash = realMtime(path.join(dir, 'inboxes', 'dashboard-user.json')) ?? 0;
+  const lead = realMtime(path.join(dir, 'inboxes', 'team-lead.json')) ?? 0;
+  const score = Math.max(cfg, dash, lead);
+  if (!best || score > best.score) best = { dir, score };
+}
+if (best) process.stdout.write(best.dir);
+" "$TEAMS_DIR" "$SUPERBOT2_NAME")
+
+# Exit silently if no live orchestrator team was found
+[[ -z "$TEAM_DIR" || ! -f "$TEAM_DIR/config.json" ]] && exit 0
 
 # Ensure log directory exists
 mkdir -p "$DIR/logs"
@@ -76,13 +106,15 @@ NOW_HOUR=$(date '+%H')
 NOW_MIN=$(date '+%M')
 NOW_DAY=$(date '+%a' | tr '[:upper:]' '[:lower:]')
 NOW_DATE=$(date '+%Y-%m-%d')
+NOW_DOM=$(date '+%d' | sed 's/^0//')  # day of month, no leading zero (1..31)
+NOW_MONTH=$(date '+%m' | sed 's/^0//')  # month, no leading zero (1..12)
 
 # Find due jobs, update last-run tracker, output JSON array of due jobs
 RESULT=$(node -e "
 const fs = require('fs');
 const schedule = JSON.parse(fs.readFileSync(process.argv[1], 'utf8'));
 const lastRun = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
-const [nowHour, nowMin, nowDay, nowDate] = [process.argv[3], process.argv[4], process.argv[5], process.argv[6]];
+const [nowHour, nowMin, nowDay, nowDate, nowDom, nowMonth] = [process.argv[3], process.argv[4], process.argv[5], process.argv[6], parseInt(process.argv[7], 10), parseInt(process.argv[8], 10)];
 
 // Migrate old-format lastRun keys (keyed by job.name) to new format (keyed by composite key)
 for (const job of schedule) {
@@ -102,6 +134,18 @@ for (const job of schedule) {
     const [jobH, jobM] = t.split(':');
     if (jobH !== nowHour || jobM !== nowMin) continue;
     if (job.days && job.days.length > 0 && !job.days.includes(nowDay)) continue;
+    // One-shot date guard: if 'date' is set, only fire on that exact YYYY-MM-DD
+    if (job.date && job.date !== nowDate) continue;
+    // Day-of-month guard: integer (1..31) or array of ints
+    if (job.dayOfMonth != null) {
+      const dom = Array.isArray(job.dayOfMonth) ? job.dayOfMonth : [job.dayOfMonth];
+      if (!dom.map(Number).includes(nowDom)) continue;
+    }
+    // Months-of-year guard: integer (1..12) or array of ints (e.g. [2,5,8,11] for quarterly)
+    if (job.months != null) {
+      const mm = Array.isArray(job.months) ? job.months : [job.months];
+      if (!mm.map(Number).includes(nowMonth)) continue;
+    }
     const key = job.name + ':' + nowDate + 'T' + t;
     if (lastRun[key] === key) continue;
     lastRun[key] = key;
@@ -112,7 +156,7 @@ for (const job of schedule) {
 }
 fs.writeFileSync(process.argv[2], JSON.stringify(lastRun, null, 2));
 if (due.length > 0) console.log(JSON.stringify(due));
-" "$SCHEDULE" "$LAST_RUN" "$NOW_HOUR" "$NOW_MIN" "$NOW_DAY" "$NOW_DATE" 2>> "$LOG")
+" "$SCHEDULE" "$LAST_RUN" "$NOW_HOUR" "$NOW_MIN" "$NOW_DAY" "$NOW_DATE" "$NOW_DOM" "$NOW_MONTH" 2>> "$LOG")
 
 [[ -z "$RESULT" ]] && exit 0
 
