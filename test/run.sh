@@ -19,5 +19,6 @@ echo
 echo "=== watcher (node) integration tests ==="
 node --test --test-concurrency=1 \
   "$DIR/telegram-watcher-active-inbox.test.mjs" \
+  "$DIR/telegram-watcher-typing.test.mjs" \
   "$DIR/telegram-watcher-tg.test.mjs" \
   "$DIR/telegram-watcher-nodrop.test.mjs"
