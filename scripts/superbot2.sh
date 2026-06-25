@@ -285,12 +285,25 @@ while true; do
   # Capture exit code without letting set -e kill the launcher.
   # "|| true" would swallow $?, so we use "cmd && ... || ..." instead.
   RUN_START=$(date +%s)
-  ENABLE_CLAUDEAI_MCP_SERVERS=false claude "${CLAUDE_ARGS[@]}" "$INITIAL_MSG" && CLAUDE_EXIT=0 || CLAUDE_EXIT=$?
+  # Run claude in the background so we can attach a caffeinate companion to its
+  # PID. claude stays a DIRECT child of the launcher so the restart watchdog's
+  # `pkill -P "$LAUNCHER_PID"` still terminates it correctly.
+  ENABLE_CLAUDEAI_MCP_SERVERS=false claude "${CLAUDE_ARGS[@]}" "$INITIAL_MSG" &
+  CLAUDE_PID=$!
+  # Anti-App-Nap / anti-idle-sleep companion: -d display, -i system idle,
+  # -m disk idle, -s on AC, -u declares user activity. -w exits when claude
+  # exits. Holding these assertions keeps the orchestrator from being throttled
+  # when Terminal.app is unfocused/occluded (App Nap) or the machine idles.
+  caffeinate -dimsu -w "$CLAUDE_PID" &
+  CAFFEINATE_PID=$!
+  wait "$CLAUDE_PID" && CLAUDE_EXIT=0 || CLAUDE_EXIT=$?
   RUN_DURATION=$(( $(date +%s) - RUN_START ))
 
-  # Claude exited — clean up watchdog
+  # Claude exited — clean up watchdog and caffeinate companion
   kill $WATCHDOG_PID 2>/dev/null
   wait $WATCHDOG_PID 2>/dev/null
+  kill $CAFFEINATE_PID 2>/dev/null
+  wait $CAFFEINATE_PID 2>/dev/null
 
   # Check for explicit stop request
   if [[ -f "$STOP_FLAG" ]]; then
