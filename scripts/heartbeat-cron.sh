@@ -26,7 +26,47 @@ SUPERBOT2_NAME="${SUPERBOT2_NAME:-superbot2}"
 DIR="${SUPERBOT2_HOME:-$HOME/.$SUPERBOT2_NAME}"
 CLAUDE_DIR="$DIR/.claude"
 FINGERPRINT_FILE="$DIR/.heartbeat-last-fingerprint"
-INBOX="$CLAUDE_DIR/teams/$SUPERBOT2_NAME/inboxes/team-lead.json"
+# Bootstrap node onto PATH (launchd runs with a minimal PATH that lacks node/nvm/asdf).
+# Without this the active-team detection below would exit 127 and — under `set -eo pipefail`
+# — abort the whole heartbeat. Mirrors scripts/scheduler.sh.
+[[ -f "$DIR/.node-path" ]] && export PATH="$(cat "$DIR/.node-path"):$PATH"
+export PATH="$HOME/.local/bin:$HOME/.asdf/shims:$HOME/.asdf/bin:$PATH"
+
+# Resolve the ACTIVE orchestrator team inbox. With TeamCreate unavailable in the current
+# harness, each orchestrator session registers under a session-based team name (e.g.
+# 'session-8f720164') instead of the fixed 'superbot2'. Hardcoding teams/superbot2 sent
+# every heartbeat to a dead inbox the live orchestrator never reads (silent outage — the
+# periodic actionable nudge never arrived). Mirror scheduler.sh / dashboard/active-team-inbox.mjs:
+# among teams with a REAL config.json, pick the one whose activity is freshest. An explicit
+# SUPERBOT2_NAME other than the legacy 'superbot2' default forces that team.
+HB_TEAM_DIR=$(node -e "
+const fs = require('fs'), path = require('path');
+const teamsDir = process.argv[1], pinned = process.argv[2];
+function realMtime(p) { try { const st = fs.lstatSync(p); if (st.isSymbolicLink() || !st.isFile()) return null; return st.mtimeMs; } catch { return null; } }
+if (pinned && pinned !== 'superbot2') { process.stdout.write(path.join(teamsDir, pinned)); process.exit(0); }
+let teams = [];
+try { teams = fs.readdirSync(teamsDir); } catch { process.exit(0); }
+let best = null;
+for (const t of teams) {
+  const dir = path.join(teamsDir, t);
+  const cfg = realMtime(path.join(dir, 'config.json'));
+  if (cfg === null) continue; // not a live/registered orchestrator team
+  const dash = realMtime(path.join(dir, 'inboxes', 'dashboard-user.json')) ?? 0;
+  const lead = realMtime(path.join(dir, 'inboxes', 'team-lead.json')) ?? 0;
+  const score = Math.max(cfg, dash, lead);
+  if (!best || score > best.score) best = { dir, score };
+}
+if (best) process.stdout.write(best.dir);
+" "$CLAUDE_DIR/teams" "$SUPERBOT2_NAME" 2>/dev/null) || HB_TEAM_DIR=""
+
+# `|| HB_TEAM_DIR=""` above: if node is missing/crashes, neutralize `set -e` for this
+# assignment so we reach the graceful fallback below instead of aborting the heartbeat.
+if [[ -n "$HB_TEAM_DIR" && -f "$HB_TEAM_DIR/config.json" ]]; then
+  INBOX="$HB_TEAM_DIR/inboxes/team-lead.json"
+else
+  # Fall back to the legacy fixed-team path (no worse than the prior behavior)
+  INBOX="$CLAUDE_DIR/teams/$SUPERBOT2_NAME/inboxes/team-lead.json"
+fi
 ACTIVITY_LOG="$DIR/logs/heartbeat-activity.json"
 KNOWLEDGE_HASH_FILE="$DIR/.heartbeat-knowledge-hashes"
 
@@ -478,7 +518,11 @@ if [[ -n "$previous_fingerprint" ]]; then
       # Look up previous hash for this file
       prev_hash=""
       if [[ -n "$prev_k_hashes" ]]; then
-        prev_hash=$(echo "$prev_k_hashes" | grep "  ${fname}$" | head -1 | awk '{print $1}')
+        # `|| true`: grep exits 1 when this knowledge file isn't in the previous-hash
+        # list (a NEW file). Under `set -eo pipefail` that nonzero status aborted the
+        # whole heartbeat mid-run (broken since 2026-02-26 — fingerprint/activity never
+        # advanced, so the periodic nudge silently stopped). Treat no-match as empty.
+        prev_hash=$(echo "$prev_k_hashes" | grep "  ${fname}$" | head -1 | awk '{print $1}' || true)
       fi
 
       if [[ -z "$prev_hash" ]]; then
