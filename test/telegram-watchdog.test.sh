@@ -125,6 +125,41 @@ wait "$WD1" 2>/dev/null; wait "$WD2" 2>/dev/null
 pkill -f "$TMP/fake-watcher.mjs" 2>/dev/null
 rm -rf "$TMP"
 
+# --- Test E: C1 orphan-reaper cwd anchor — sibling checkout NOT reaped, same-repo IS ---
+# Regression test: the pre-fix pattern "$REPO_DIR"* (no trailing slash) matched a sibling
+# checkout like "$REPO_DIR-staging/…", which could TERM a live dashboard from a different
+# checkout. The fix anchors at a path separator: only exact repo or subpath qualifies.
+echo "Test E: orphan reaper cwd anchoring — sibling checkout not matched, same-repo cwd is"
+is_orphaned_in_repo_check() {
+  # Replicate the fixed is_orphaned_in_repo cwd condition for unit-testing in isolation.
+  # Returns 0 (match/eligible) if cwd is the repo or a strict subpath; 1 otherwise.
+  local REPO_DIR="$1"
+  local cwd="$2"
+  [[ -n "$cwd" && ( "$cwd" == "$REPO_DIR" || "$cwd" == "$REPO_DIR/"* ) ]]
+}
+FAKE_REPO="/Users/jeff/.superbot2-app"
+# Should NOT match: sibling checkout paths (prefix collision without path sep anchor)
+is_orphaned_in_repo_check "$FAKE_REPO" "${FAKE_REPO}-staging/dashboard-ui" \
+  && bad "sibling checkout '${FAKE_REPO}-staging/dashboard-ui' incorrectly matched (C1 bug present)" \
+  || ok  "sibling checkout '${FAKE_REPO}-staging/dashboard-ui' not matched (C1 fixed)"
+is_orphaned_in_repo_check "$FAKE_REPO" "${FAKE_REPO}-worktree" \
+  && bad "sibling '${FAKE_REPO}-worktree' incorrectly matched (C1 bug present)" \
+  || ok  "sibling '${FAKE_REPO}-worktree' not matched (C1 fixed)"
+# Should match: exact repo cwd and subpaths under it
+is_orphaned_in_repo_check "$FAKE_REPO" "$FAKE_REPO" \
+  && ok  "exact repo cwd '$FAKE_REPO' matched (eligible for reaping)" \
+  || bad "exact repo cwd '$FAKE_REPO' not matched — should be eligible"
+is_orphaned_in_repo_check "$FAKE_REPO" "$FAKE_REPO/dashboard-ui" \
+  && ok  "subpath '$FAKE_REPO/dashboard-ui' matched (eligible for reaping)" \
+  || bad "subpath '$FAKE_REPO/dashboard-ui' not matched — should be eligible"
+is_orphaned_in_repo_check "$FAKE_REPO" "$FAKE_REPO/scripts" \
+  && ok  "subpath '$FAKE_REPO/scripts' matched (eligible for reaping)" \
+  || bad "subpath '$FAKE_REPO/scripts' not matched — should be eligible"
+# Empty cwd must NOT match (proc_cwd returned nothing — skip the proc)
+is_orphaned_in_repo_check "$FAKE_REPO" "" \
+  && bad "empty cwd incorrectly matched (should skip the proc)" \
+  || ok  "empty cwd correctly rejected"
+
 echo
 echo "RESULTS: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

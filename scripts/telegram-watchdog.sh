@@ -81,13 +81,29 @@ telegram_enabled() {
 # orchestrator's SendMessage({to:'dashboard-user'}) reply path is otherwise rejected after
 # every restart. Running this on the watchdog's poll cadence self-heals it within one cycle,
 # decoupled from the orchestrator process. Idempotent + always exits 0; never blocks the loop.
+#
+# Sets _DU_CONFIRMED=1 once dashboard-user is known to be present, so the inner monitor
+# loop can skip redundant calls and narrow the concurrent-writer race window described in
+# dashboard/ensure-dashboard-user.mjs. Cleared at each outer-loop restart so a new
+# watcher session (which may belong to a fresh orchestrator session team) re-runs the check.
+_DU_CONFIRMED=0
 ensure_dashboard_user() {
   [ -f "$ENSURE_DASHBOARD_USER_SCRIPT" ] || return 0
   command -v node >/dev/null 2>&1 || return 0
+  # Short-circuit: already confirmed present for this watcher session — no-op.
+  [ "$_DU_CONFIRMED" -eq 1 ] && return 0
   local out
   out=$(SUPERBOT2_HOME="$SUPERBOT_DIR" node "$ENSURE_DASHBOARD_USER_SCRIPT" 2>&1) || true
-  # The CLI only prints when it actually changes the registry — forward that to the log.
-  [ -n "$out" ] && log "$out"
+  # The CLI only prints when it actually changes the registry or hits an error.
+  # No output means 'present' or 'no-team' — either way nothing left to do this session.
+  if [ -n "$out" ]; then
+    log "$out"
+  fi
+  # Mark confirmed once 'present' or 'added' (no error output, exit 0): stop calling
+  # inside the inner loop to narrow the concurrent-writer race window.
+  if [ -z "$out" ] || echo "$out" | grep -q "registered dashboard-user"; then
+    _DU_CONFIRMED=1
+  fi
   return 0
 }
 
@@ -141,6 +157,9 @@ while true; do
   fi
 
   START_TIME=$(date +%s)
+  # Reset per-session flag so a new watcher run (possibly a new orchestrator session team)
+  # re-checks dashboard-user membership before short-circuiting.
+  _DU_CONFIRMED=0
 
   log "launching watcher (backoff=${BACKOFF}s)"
 
@@ -162,7 +181,9 @@ while true; do
 
   # Monitor loop: check child status and both heartbeats
   while true; do
-    # Keep dashboard-user registered (re-runs cheaply; only acts on a session-team change).
+    # Keep dashboard-user registered. Short-circuits via _DU_CONFIRMED once confirmed present
+    # for this watcher session, so the inner loop only pays the node startup cost once per
+    # session (or once per session-team change at outer-loop restart). See ensure_dashboard_user.
     ensure_dashboard_user
 
     # Check if child is still running
