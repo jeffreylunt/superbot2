@@ -3,7 +3,8 @@
 // decision loop in dashboard/orchestrator-wake-nudge.mjs).
 //
 // STATUS: DARK. Nothing installs/loads this by default. It is staged for a DELIBERATE human
-// cutover (see scripts/install-wake-nudge.sh + knowledge/orchestrator-wake-mechanism.md).
+// cutover (see scripts/install-wake-nudge.sh +
+// ~/.superbot2/spaces/superbot2-app/knowledge/orchestrator-wake-mechanism.md).
 //
 // WHAT IT DOES
 //   Every pollMs, it resolves the active orchestrator team-lead inbox + the orchestrator's tmux
@@ -33,7 +34,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import { resolveActiveTeamInboxesDir } from '../dashboard/active-team-inbox.mjs'
-import { tick, DEFAULT_CONFIG } from '../dashboard/orchestrator-wake-nudge.mjs'
+import { tick, DEFAULT_CONFIG, newestUnreadMs, hasUnread } from '../dashboard/orchestrator-wake-nudge.mjs'
 
 const pexecFile = promisify(execFile)
 const REPO_DIR = join(dirname(fileURLToPath(import.meta.url)), '..')
@@ -54,7 +55,13 @@ function log(line) {
   process.stdout.write(`[wake-nudge] ${line}\n`)
 }
 
-// --- active inbox mtime ----------------------------------------------------
+// --- newest UNREAD inbox message time --------------------------------------
+// Returns the arrival time (ms) of the newest message the orchestrator plausibly hasn't read,
+// or null if the inbox is empty / all-read (=> no backlog). (Review I2: use the per-message
+// `read`/`timestamp` fields — which the inbox actually carries — instead of the file mtime, so
+// an in-place `read:true` rewrite that bumps the file mtime can't masquerade as a fresh message,
+// and the value genuinely means "newest unprocessed" as decideNudge's contract states.) Falls
+// back to the file mtime only when messages lack a usable timestamp.
 async function readInboxMtimeMs() {
   const inboxesDir = await resolveActiveTeamInboxesDir(TEAMS_DIR, {
     pinnedTeam: process.env.SUPERBOT2_NAME || '',
@@ -65,9 +72,12 @@ async function readInboxMtimeMs() {
   try {
     const raw = await readFile(inbox, 'utf-8')
     const arr = JSON.parse(raw)
-    if (!Array.isArray(arr) || arr.length === 0) return null // empty inbox => no backlog
+    if (!hasUnread(arr)) return null // empty / all-read => no backlog
+    const newest = newestUnreadMs(arr)
+    if (newest !== null) return newest
+    // Has unread but no parseable per-message timestamp: fall back to the file mtime.
     const st = await stat(inbox)
-    return st.mtimeMs // when a message was last appended
+    return st.mtimeMs
   } catch {
     return null
   }
@@ -106,11 +116,25 @@ async function discoverPane() {
       return cachedPane
     } catch { cachedPane = null }
   }
-  // 1. Find the superbot2 launcher PID(s).
+  // 1. Find the superbot2 launcher PID(s). (Review I1: anchor the match so a process whose argv
+  //    merely *contains* the path — a child claude, a worker, even this script — isn't matched.
+  //    `pgrep -f` matches the whole command line; we filter to entries whose command is exactly
+  //    the launcher being run, i.e. `<sh> <REPO_DIR>/superbot2` with the path at a word boundary.)
   let launcherPids = []
   try {
     const { stdout } = await pexecFile('pgrep', ['-f', `${REPO_DIR}/superbot2`])
-    launcherPids = stdout.split('\n').map((s) => s.trim()).filter(Boolean)
+    const candidates = stdout.split('\n').map((s) => s.trim()).filter(Boolean)
+    // Re-read each candidate's full command and keep only true launcher invocations:
+    // the superbot2 path must appear as a standalone argv token (followed by end/space),
+    // and the command must be a shell running it (not `claude`, `node`, `grep`, etc.).
+    const launcherRe = new RegExp(`(^|\\s)${REPO_DIR.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/superbot2(\\s|$)`)
+    for (const pid of candidates) {
+      try {
+        const { stdout: cmd } = await pexecFile('ps', ['-o', 'command=', '-p', pid])
+        const c = cmd.trim()
+        if (launcherRe.test(c) && /(^|\/)(ba|z|d|)sh\b/.test(c)) launcherPids.push(pid)
+      } catch { /* pid gone */ }
+    }
   } catch { /* none running */ }
   if (launcherPids.length === 0) return null
 
@@ -132,18 +156,27 @@ async function discoverPane() {
       .map((s) => { const i = s.indexOf(':'); return { id: s.slice(0, i), pid: s.slice(i + 1) } })
   } catch { return null }
 
+  // Resolve the DISTINCT set of panes that host a launcher subtree. (Review I1: if more than one
+  // distinct pane qualifies, the target is AMBIGUOUS — fail closed and refuse to nudge rather
+  // than guessing, so we can never send Enter to the wrong pane.)
+  const matchedPanes = new Set()
   for (const lp of launcherPids) {
-    // Walk lp up its ancestry; if we hit a pane_pid, that's the pane.
     let cur = lp
     const seen = new Set()
     while (cur && cur !== '1' && !seen.has(cur)) {
       seen.add(cur)
       const pane = panes.find((p) => p.pid === cur)
-      if (pane) { cachedPane = pane.id; return pane.id }
+      if (pane) { matchedPanes.add(pane.id); break }
       cur = ppidOf.get(cur)
     }
   }
-  return null
+  if (matchedPanes.size === 0) return null
+  if (matchedPanes.size > 1) {
+    log(`pane discovery AMBIGUOUS (${[...matchedPanes].join(',')}) — failing closed, no nudge`)
+    return null
+  }
+  cachedPane = [...matchedPanes][0]
+  return cachedPane
 }
 
 async function getTitle() {

@@ -14,6 +14,8 @@ import {
   promptIsEmpty,
   decideNudge,
   tick,
+  newestUnreadMs,
+  hasUnread,
   UNKNOWN_PROMPT,
 } from '../dashboard/orchestrator-wake-nudge.mjs'
 
@@ -153,6 +155,40 @@ test('after cooldown elapses, a still-stalled backlog nudges again', () => {
   const r = decideNudge(passing({ nowMs: now, lastNudgeMs: now - 200_000 }), CFG)
   assert.equal(r.nudge, true)
   assert.equal(r.reason, 'stalled-backlog')
+})
+
+// --- newestUnreadMs / hasUnread (review I2: backlog from message fields, not file mtime) ---
+test('newestUnreadMs returns the newest UNREAD message timestamp', () => {
+  const arr = [
+    { read: true, timestamp: '2026-06-28T00:00:30Z' }, // read -> ignored even though newest
+    { read: false, timestamp: '2026-06-28T00:00:10Z' },
+    { read: false, timestamp: '2026-06-28T00:00:20Z' }, // newest unread
+  ]
+  assert.equal(newestUnreadMs(arr), Date.parse('2026-06-28T00:00:20Z'))
+})
+
+test('newestUnreadMs is null for empty / all-read inboxes', () => {
+  assert.equal(newestUnreadMs([]), null)
+  assert.equal(newestUnreadMs(null), null)
+  assert.equal(newestUnreadMs([{ read: true, timestamp: '2026-06-28T00:00:00Z' }]), null)
+})
+
+test('newestUnreadMs treats missing `read` as unread, and is null when no timestamp parses', () => {
+  assert.equal(
+    newestUnreadMs([{ timestamp: '2026-06-28T00:00:00Z' }]),
+    Date.parse('2026-06-28T00:00:00Z'),
+    'missing read field => unread',
+  )
+  assert.equal(newestUnreadMs([{ read: false }]), null, 'unread but no timestamp => null')
+  assert.equal(newestUnreadMs([{ read: false, timestamp: 'garbage' }]), null)
+})
+
+test('hasUnread reflects presence of any unread message regardless of timestamp', () => {
+  assert.equal(hasUnread([]), false)
+  assert.equal(hasUnread(null), false)
+  assert.equal(hasUnread([{ read: true }]), false)
+  assert.equal(hasUnread([{ read: false }]), true) // unread but no timestamp -> still backlog
+  assert.equal(hasUnread([{ read: true }, {}]), true) // missing read field => unread
 })
 
 // --- tick(): full loop with mock deps (the side-effecting wake path) ---

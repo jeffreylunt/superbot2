@@ -3,6 +3,7 @@
 #
 # *** DO NOT RUN THIS CASUALLY. *** This loads a watcher that can send `tmux send-keys Enter`
 # into the LIVE orchestrator pane. It is intentionally NOT run by the build that created it.
+# Full runbook: ~/.superbot2/spaces/superbot2-app/knowledge/orchestrator-wake-mechanism.md
 # Cut it over DELIBERATELY, and only after a dry-run shakedown:
 #
 #   # 1. Observe-only against the live system (NEVER sends keys):
