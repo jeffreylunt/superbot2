@@ -13,6 +13,7 @@ import {
   extractPromptText,
   promptIsEmpty,
   decideNudge,
+  tick,
   UNKNOWN_PROMPT,
 } from '../dashboard/orchestrator-wake-nudge.mjs'
 
@@ -152,4 +153,74 @@ test('after cooldown elapses, a still-stalled backlog nudges again', () => {
   const r = decideNudge(passing({ nowMs: now, lastNudgeMs: now - 200_000 }), CFG)
   assert.equal(r.nudge, true)
   assert.equal(r.reason, 'stalled-backlog')
+})
+
+// --- tick(): full loop with mock deps (the side-effecting wake path) ---
+function mockDeps(overrides = {}) {
+  const now = 1_000_000_000
+  const calls = { sendNudge: 0, logs: [] }
+  const deps = {
+    nowMs: () => now,
+    readInboxMtimeMs: async () => now - 60_000, // 60s-old backlog
+    readTranscriptMtimeMs: async () => now - 600_000, // idle, before the message
+    getTitle: async () => 'Begin coding cycle', // no spinner
+    capturePane: async () => '──────\n❯ \n──────', // empty prompt
+    sendNudge: async () => { calls.sendNudge++ },
+    log: (l) => calls.logs.push(l),
+    ...overrides,
+  }
+  return { deps, calls, now }
+}
+
+test('tick sends a nudge on a genuine stall and carries lastNudgeMs forward', async () => {
+  const { deps, calls, now } = mockDeps()
+  const out = await tick(deps, CFG, null)
+  assert.equal(out.decision.nudge, true)
+  assert.equal(calls.sendNudge, 1)
+  assert.equal(out.lastNudgeMs, now, 'cooldown clock starts at this nudge')
+  assert.equal(calls.logs.length, 1)
+})
+
+test('tick does NOT nudge (and does not call sendNudge) when prompt has pending text', async () => {
+  const { deps, calls } = mockDeps({
+    capturePane: async () => '❯ Show me the Jedd demo.',
+  })
+  const out = await tick(deps, CFG, null)
+  assert.equal(out.decision.nudge, false)
+  assert.equal(out.decision.reason, 'prompt-not-empty')
+  assert.equal(calls.sendNudge, 0)
+  assert.equal(out.lastNudgeMs, null, 'no nudge -> cooldown clock unchanged')
+})
+
+test('tick fails closed when the pane capture fails (capturePane returns null)', async () => {
+  const { deps, calls } = mockDeps({ capturePane: async () => null })
+  const out = await tick(deps, CFG, null)
+  assert.equal(out.decision.nudge, false)
+  assert.equal(out.decision.reason, 'prompt-not-empty') // null pane -> promptEmpty false
+  assert.equal(calls.sendNudge, 0)
+})
+
+test('tick fails closed when the transcript mtime is unknown', async () => {
+  const { deps, calls } = mockDeps({ readTranscriptMtimeMs: async () => null })
+  const out = await tick(deps, CFG, null)
+  assert.equal(out.decision.nudge, false)
+  assert.equal(out.decision.reason, 'transcript-unknown')
+  assert.equal(calls.sendNudge, 0)
+})
+
+test('tick respects cooldown carried from a prior nudge', async () => {
+  const { deps, calls, now } = mockDeps()
+  const out = await tick(deps, CFG, now - 10_000) // nudged 10s ago, cooldown 120s
+  assert.equal(out.decision.nudge, false)
+  assert.equal(out.decision.reason, 'cooldown')
+  assert.equal(calls.sendNudge, 0)
+  assert.equal(out.lastNudgeMs, now - 10_000, 'cooldown clock preserved')
+})
+
+test('tick treats a spinner title as mid-turn (no nudge)', async () => {
+  const { deps, calls } = mockDeps({ getTitle: async () => '⠹ Begin coding cycle' })
+  const out = await tick(deps, CFG, null)
+  assert.equal(out.decision.nudge, false)
+  assert.equal(out.decision.reason, 'spinner-active')
+  assert.equal(calls.sendNudge, 0)
 })
