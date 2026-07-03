@@ -285,7 +285,30 @@ function acquireSingleton() {
   process.on('SIGTERM', () => { cleanup(); process.exit(0) })
 }
 
+// --health: print a one-shot JSON liveness snapshot (for orchestrator-watchdog.sh wedge
+// detection) and exit. Reuses the exact same discovery/parsing as the nudge gates. Never
+// takes the singleton pidfile and never sends keys.
+async function healthSnapshot() {
+  const nowMs = Date.now()
+  const backlogMs = await readInboxMtimeMs()
+  const transcriptMs = await readTranscriptMtimeMs()
+  const pane = await discoverPane()
+  const cap = pane ? await capturePaneById(pane) : null
+  return {
+    paneFound: !!pane,
+    backlogAgeS: backlogMs == null ? null : Math.round((nowMs - backlogMs) / 1000),
+    transcriptAgeS: transcriptMs == null ? null : Math.round((nowMs - transcriptMs) / 1000),
+    // true = the orchestrator has NOT taken a turn since the newest unread message arrived
+    transcriptBeforeBacklog: backlogMs != null && transcriptMs != null && transcriptMs < backlogMs,
+    promptEmpty: cap != null && promptIsEmpty(cap),
+  }
+}
+
 async function main() {
+  if (args.includes('--health')) {
+    process.stdout.write(JSON.stringify(await healthSnapshot()) + '\n')
+    return
+  }
   let lastNudgeMs = null
   log(`starting (dry-run=${DRY_RUN} once=${ONCE} forcedPane=${FORCED_PANE || '(auto)'} pollMs=${config.pollMs})`)
   const runOne = async () => {
