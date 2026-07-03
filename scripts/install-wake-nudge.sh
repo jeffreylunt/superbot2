@@ -29,6 +29,12 @@ SUPERBOT2_HOME="${SUPERBOT2_HOME:-$HOME/.superbot2}"
 LOG_DIR="$SUPERBOT2_HOME/logs"
 NODE_BIN="$(command -v node || true)"
 if [[ -z "$NODE_BIN" ]]; then echo "node not found on PATH" >&2; exit 1; fi
+# tmux is the whole mechanism — resolve it at install time and bake its dir into the
+# agent's PATH. launchd's default PATH (/usr/bin:/bin:...) does NOT include homebrew,
+# so without this every tmux call fails and the nudge fail-closes forever
+# (observed live 2026-07-03: endless "no-nudge (prompt-not-empty)" from a null capture).
+TMUX_BIN="$(command -v tmux || true)"
+if [[ -z "$TMUX_BIN" ]]; then echo "tmux not found on PATH" >&2; exit 1; fi
 
 # Optional: install in dry-run (observe-only) mode.
 EXTRA_ARGS=""
@@ -69,7 +75,7 @@ cat > "$PLIST_PATH" << EOF
     <key>SUPERBOT2_NAME</key>
     <string>${SUPERBOT2_NAME:-}</string>
     <key>PATH</key>
-    <string>$(dirname "$NODE_BIN"):/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>$(dirname "$NODE_BIN"):$(dirname "$TMUX_BIN"):/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
 </dict>
 </plist>

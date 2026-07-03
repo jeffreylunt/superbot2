@@ -197,11 +197,20 @@ async function capturePane() {
   } catch { return null }
 }
 
+// The sentinel the nudge submits. A bare Enter on an EMPTY prompt does NOT start a turn
+// (verified live 2026-07-03: NUDGE sent 15:24:27Z, Enter delivered, no turn, backlog stayed
+// stalled) — the harness only drains the team inbox at TURN START, so the nudge must submit
+// an actual message. The empty-prompt gate guarantees we never clobber user-typed text, and
+// the cooldown caps this at one short sentinel turn per stall window.
+const WAKE_TEXT = process.env.WAKE_NUDGE_TEXT ||
+  '[wake-nudge] Your team inbox has a stalled backlog — process pending messages now.'
+
 async function sendNudge() {
   const pane = await discoverPane()
   if (!pane) { log('sendNudge: no pane resolved, skipping'); return }
-  if (DRY_RUN) { log(`DRY-RUN: would send Enter to pane ${pane}`); return }
-  // Send a bare Enter on the (verified-empty) prompt to force a harness turn.
+  if (DRY_RUN) { log(`DRY-RUN: would submit wake sentinel to pane ${pane}`); return }
+  // -l: type the sentinel literally (no key-name interpretation), then submit it.
+  await pexecFile('tmux', ['send-keys', '-t', pane, '-l', WAKE_TEXT])
   await pexecFile('tmux', ['send-keys', '-t', pane, 'Enter'])
 }
 
