@@ -99,15 +99,29 @@ let escalationMessageMap = new Map() // e.g. 12345 -> "esc-personal-assistant-em
 
 // Message ID tracking for reply threading
 // lastUserMessageId: the Telegram message_id of the user's most recent non-command message
+// lastUserMessageAt: epoch ms when that message was received (freshness gate)
 // messageMap: maps inbox index -> Telegram message_id of the bot's sent reply
-// userMessageAnchors: array of {inboxCountAtSend, telegramMessageId} recording which
+// userMessageAnchors: array of {inboxCountAtSend, telegramMessageId, at} recording which
 //   user message was active when each inbox reply arrived. Used to thread each
 //   orchestrator reply back to the correct user message instead of always the latest.
 let lastUserMessageId = null
-let messageMap = {} // { inboxIdx: telegramMessageId, ... } + { lastUserMessageId }
-let userMessageAnchors = [] // [{inboxCountAtSend, telegramMessageId}, ...]
+let lastUserMessageAt = 0
+let messageMap = {} // { inboxIdx: telegramMessageId, ... } + { lastUserMessageId, lastUserMessageAt }
+let userMessageAnchors = [] // [{inboxCountAtSend, telegramMessageId, at}, ...]
 const MAX_MESSAGE_MAP_SIZE = 200 // Keep map bounded
 const MAX_ANCHORS = 200 // Keep anchors bounded
+// Reply-threading FRESHNESS GATE (2026-07-03 incident): never thread a reply onto a user
+// message older than this. Stale/mis-mapped reply_to targets (anchors surviving an
+// active-inbox switch pointed at a PRIOR session's messages) made watcher replies not
+// surface for the user, while a plain un-threaded send demonstrably delivered. When a
+// threading target isn't provably fresh, send un-threaded — delivery beats threading.
+// Env override TG_THREAD_MAX_AGE_MS: any finite value >= 0 is honored (0 disables
+// threading entirely); unset/empty/invalid falls back to the default.
+const THREAD_MAX_AGE_MS = (() => {
+  const raw = process.env.TG_THREAD_MAX_AGE_MS
+  const n = raw === undefined || raw === '' ? NaN : Number(raw)
+  return Number.isFinite(n) && n >= 0 ? n : 30 * 60 * 1000
+})()
 
 // Message editing: track last sent text message for rapid-fire reply coalescing
 let lastSentBotMessageId = null // Telegram message_id of the last text reply sent
@@ -272,7 +286,13 @@ async function applyResolvedInbox(resolved, dashMtime) {
       log(`Active team inbox switched: ${previous} -> ${resolved} — resetting outbound counter to 0`)
       lastSentReplyCount = 0
       replyBaseline = 0
+      // Anchors map OLD-inbox reply indices -> user message ids. The new inbox's indices
+      // restart at 0, so keeping them MIS-THREADS every new reply onto the previous
+      // session's (stale) user messages — root cause of the 2026-07-03 "replies don't
+      // surface" incident. Drop them; fresh anchors are rebuilt from new inbound messages.
+      userMessageAnchors = []
       await saveLastSentCount(lastSentReplyCount)
+      await saveMessageMap()
     }
   }
   activeInboxResolved = true
@@ -472,7 +492,7 @@ async function sendPhoto(filePath, caption, replyToMessageId) {
   const fields = {
     chat_id: chatId,
     ...(caption ? { caption, parse_mode: 'HTML' } : {}),
-    ...(replyToMessageId ? { reply_to_message_id: String(replyToMessageId) } : {}),
+    ...(replyToMessageId ? { reply_to_message_id: String(replyToMessageId), allow_sending_without_reply: 'true' } : {}),
   }
   return tgMultipart('sendPhoto', fields, [{ field: 'photo', filePath }])
 }
@@ -489,7 +509,7 @@ async function sendMediaGroup(filePaths, caption, replyToMessageId) {
   const fields = {
     chat_id: chatId,
     media: JSON.stringify(media),
-    ...(replyToMessageId ? { reply_to_message_id: String(replyToMessageId) } : {}),
+    ...(replyToMessageId ? { reply_to_message_id: String(replyToMessageId), allow_sending_without_reply: 'true' } : {}),
   }
   const files = filePaths.map((filePath, i) => ({
     field: `photo${i}`,
@@ -505,7 +525,7 @@ async function sendMessage(text, opts = {}) {
     text,
     parse_mode: opts.parseMode || 'HTML',
     ...opts.replyMarkup ? { reply_markup: opts.replyMarkup } : {},
-    ...opts.replyToMessageId ? { reply_to_message_id: opts.replyToMessageId } : {},
+    ...opts.replyToMessageId ? { reply_to_message_id: opts.replyToMessageId, allow_sending_without_reply: true } : {},
   }
   return tg('sendMessage', body)
 }
@@ -652,6 +672,7 @@ async function loadMessageMap() {
   const data = await readJsonFile(MESSAGE_MAP_FILE)
   if (data && typeof data === 'object') {
     if (data.lastUserMessageId) lastUserMessageId = data.lastUserMessageId
+    if (typeof data.lastUserMessageAt === 'number') lastUserMessageAt = data.lastUserMessageAt
     if (Array.isArray(data._userMessageAnchors)) userMessageAnchors = data._userMessageAnchors
     return data
   }
@@ -660,7 +681,7 @@ async function loadMessageMap() {
 
 async function saveMessageMap() {
   // Prune old entries to keep the map bounded
-  const keys = Object.keys(messageMap).filter(k => k !== 'lastUserMessageId' && k !== '_userMessageAnchors')
+  const keys = Object.keys(messageMap).filter(k => k !== 'lastUserMessageId' && k !== 'lastUserMessageAt' && k !== '_userMessageAnchors')
   if (keys.length > MAX_MESSAGE_MAP_SIZE) {
     // Keep only the most recent entries (highest numeric keys)
     const numericKeys = keys.filter(k => !isNaN(parseInt(k, 10))).map(Number).sort((a, b) => a - b)
@@ -674,6 +695,7 @@ async function saveMessageMap() {
     userMessageAnchors = userMessageAnchors.slice(-MAX_ANCHORS)
   }
   messageMap.lastUserMessageId = lastUserMessageId
+  messageMap.lastUserMessageAt = lastUserMessageAt
   messageMap._userMessageAnchors = userMessageAnchors
   await writeJsonFile(MESSAGE_MAP_FILE, messageMap)
 }
@@ -808,9 +830,11 @@ async function handleTextMessage(text, msg) {
   }
 
   // Regular message — relay to orchestrator
-  // Track the user's message ID for reply threading
+  // Track the user's message ID for reply threading (with receive time for the
+  // threading freshness gate).
   if (msg && msg.message_id) {
     lastUserMessageId = msg.message_id
+    lastUserMessageAt = Date.now()
   }
 
   // Activate Telegram conversation — set baseline to lastSentReplyCount so we
@@ -824,6 +848,7 @@ async function handleTextMessage(text, msg) {
       userMessageAnchors.push({
         inboxCountAtSend: orchestratorReplies.length,
         telegramMessageId: msg.message_id,
+        at: Date.now(),
       })
     }
   } catch {
@@ -832,6 +857,7 @@ async function handleTextMessage(text, msg) {
       userMessageAnchors.push({
         inboxCountAtSend: lastSentReplyCount,
         telegramMessageId: msg.message_id,
+        at: Date.now(),
       })
     }
   }
@@ -1385,7 +1411,7 @@ async function sendNewTextReply(html, plainText, replyToId) {
       chat_id: chatId,
       text: html,
       parse_mode: 'HTML',
-      ...(replyToId ? { reply_to_message_id: replyToId } : {}),
+      ...(replyToId ? { reply_to_message_id: replyToId, allow_sending_without_reply: true } : {}),
     })
     log(`Sent reply to Telegram (reply_to=${replyToId || 'none'}): ${plainText.slice(0, 60)}...`)
     if (result?.message_id) {
@@ -1400,7 +1426,7 @@ async function sendNewTextReply(html, plainText, replyToId) {
       const result = await tg('sendMessage', {
         chat_id: chatId,
         text: plainText,
-        ...(replyToId ? { reply_to_message_id: replyToId } : {}),
+        ...(replyToId ? { reply_to_message_id: replyToId, allow_sending_without_reply: true } : {}),
       })
       log(`Sent reply as plain text fallback`)
       if (result?.message_id) {
@@ -1453,7 +1479,11 @@ async function checkForReplies() {
     if (lastSentReplyCount > orchestratorReplies.length) {
       log(`Inbox truncated: counter was ${lastSentReplyCount}, inbox now has ${orchestratorReplies.length} replies — resetting to 0`)
       lastSentReplyCount = 0
+      // A truncated inbox means a NEW orchestrator session on the same team path —
+      // anchor inboxCountAtSend values refer to the old inbox and would mis-thread.
+      userMessageAnchors = []
       await saveLastSentCount(lastSentReplyCount)
+      await saveMessageMap()
     }
 
     // Always forward unsent replies — no conversation gating.
@@ -1490,10 +1520,20 @@ async function checkForReplies() {
       // pick the FIRST in that group — the earliest message that could have
       // triggered this reply. This prevents all replies from threading under
       // the user's most recent message when they sent several in a row.
-      let replyToId = lastUserMessageId || null
+      //
+      // FRESHNESS GATE (2026-07-03 incident): only thread onto a target we can PROVE is
+      // recent (has a timestamp within THREAD_MAX_AGE_MS). Legacy anchors without an
+      // `at` timestamp, and anything older, are treated as stale — the reply is sent
+      // UN-threaded instead, which is the mode that demonstrably delivers. A wrong or
+      // ancient reply_to target buries the message for the user; no threading is
+      // strictly better than stale threading.
+      const nowMs = Date.now()
+      const isFreshTs = (at) => typeof at === 'number' && at > 0 && (nowMs - at) <= THREAD_MAX_AGE_MS
+      let replyToId = (lastUserMessageId && isFreshTs(lastUserMessageAt)) ? lastUserMessageId : null
       if (userMessageAnchors.length > 0) {
         let bestAnchor = null
         for (const anchor of userMessageAnchors) {
+          if (!isFreshTs(anchor.at)) continue // stale/legacy anchor — never thread onto it
           if (anchor.inboxCountAtSend <= replyIdx) {
             if (!bestAnchor || anchor.inboxCountAtSend > bestAnchor.inboxCountAtSend) {
               // Higher inboxCountAtSend — strictly better match
@@ -1559,7 +1599,7 @@ async function checkForReplies() {
               chat_id: chatId,
               text: markdownToTelegramHtml(truncated),
               parse_mode: 'HTML',
-              ...(replyToId ? { reply_to_message_id: replyToId } : {}),
+              ...(replyToId ? { reply_to_message_id: replyToId, allow_sending_without_reply: true } : {}),
             })
           } catch {
             await tg('sendMessage', { chat_id: chatId, text: truncated }).catch(() => {})
@@ -1945,7 +1985,11 @@ async function main() {
     if (lastSentReplyCount > orchestratorReplies.length) {
       log(`Inbox truncated since last run: counter was ${lastSentReplyCount}, inbox now has ${orchestratorReplies.length} replies — resetting to 0`)
       lastSentReplyCount = 0
+      // New session on the same team path — old anchors would mis-thread (see
+      // checkForReplies truncation reset).
+      userMessageAnchors = []
       await saveLastSentCount(lastSentReplyCount)
+      await saveMessageMap()
     }
   } catch {
     // non-critical — will be caught in checkForReplies too
