@@ -176,25 +176,25 @@ echo "$RESULT" | jq -c '.[]' | while read -r JOB; do
   # (script field set, task empty/absent) run silently — they self-report via
   # their own logs, so they must not spam team-lead 48x/day.
   if [[ -n "$JOB_TASK" && "$JOB_TASK" != "null" ]]; then
-  MSG=$(jq -n \
-    --arg from "scheduler" \
-    --arg type "scheduled_job" \
-    --arg text "Scheduled job **$JOB_NAME** is due (${JOB_TIME}):\n\n$JOB_TASK" \
-    --arg summary "Scheduled: $JOB_NAME" \
-    --arg jobName "$JOB_NAME" \
-    --arg jobTime "$JOB_TIME" \
-    --arg jobSpace "$JOB_SPACE" \
-    --argjson jobDays "$JOB_DAYS" \
-    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '{from: $from, type: $type, text: $text, summary: $summary, metadata: {jobName: $jobName, scheduledTime: $jobTime, space: (if $jobSpace != "" then $jobSpace else null end), days: $jobDays}, timestamp: $ts, read: false}')
+    MSG=$(jq -n \
+      --arg from "scheduler" \
+      --arg type "scheduled_job" \
+      --arg text "Scheduled job **$JOB_NAME** is due (${JOB_TIME}):\n\n$JOB_TASK" \
+      --arg summary "Scheduled: $JOB_NAME" \
+      --arg jobName "$JOB_NAME" \
+      --arg jobTime "$JOB_TIME" \
+      --arg jobSpace "$JOB_SPACE" \
+      --argjson jobDays "$JOB_DAYS" \
+      --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '{from: $from, type: $type, text: $text, summary: $summary, metadata: {jobName: $jobName, scheduledTime: $jobTime, space: (if $jobSpace != "" then $jobSpace else null end), days: $jobDays}, timestamp: $ts, read: false}')
 
-  if [[ -f "$INBOX" ]] && jq -e '. | type == "array"' "$INBOX" >/dev/null 2>&1; then
-    locked_write "$INBOX" '. + [$msg]' --argjson msg "$MSG"
-  else
-    echo "[$MSG]" > "$INBOX"
-  fi
+    if [[ -f "$INBOX" ]] && jq -e '. | type == "array"' "$INBOX" >/dev/null 2>&1; then
+      locked_write "$INBOX" '. + [$msg]' --argjson msg "$MSG"
+    else
+      echo "[$MSG]" > "$INBOX"
+    fi
 
-  echo "$(date '+%Y-%m-%d %H:%M') - Scheduled: $JOB_NAME → team-lead inbox" >> "$LOG"
+    echo "$(date '+%Y-%m-%d %H:%M') - Scheduled: $JOB_NAME → team-lead inbox" >> "$LOG"
   fi
 
   # Execute script if job has a "script" field (runs outside Claude Code, so claude -p works)

@@ -9,8 +9,10 @@
 // WHAT IT DOES
 //   Every pollMs, it resolves the active orchestrator team-lead inbox + the orchestrator's tmux
 //   pane + transcript jsonl, and — ONLY when a backlog has genuinely stalled and the orchestrator
-//   is idle with an empty prompt (see tick()/decideNudge gates) — sends a single Enter keypress
-//   to the pane to force the harness to take a turn and drain the inbox.
+//   is idle with an empty prompt (see tick()/decideNudge gates) — SUBMITS a short sentinel
+//   message to the pane to force the harness to take a turn and drain the inbox. (A bare Enter
+//   on an empty prompt does NOT start a turn — verified live 2026-07-03 on claude 2.1.199; the
+//   harness drains the team inbox only at TURN START.)
 //
 // SAFETY
 //   - Fail-closed everywhere: any read/capture failure => no nudge.
@@ -34,7 +36,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import { resolveActiveTeamInboxesDir } from '../dashboard/active-team-inbox.mjs'
-import { tick, DEFAULT_CONFIG, newestUnreadMs, hasUnread } from '../dashboard/orchestrator-wake-nudge.mjs'
+import { tick, DEFAULT_CONFIG, newestUnreadMs, hasUnread, promptIsEmpty, extractPromptText } from '../dashboard/orchestrator-wake-nudge.mjs'
 
 const pexecFile = promisify(execFile)
 const REPO_DIR = join(dirname(fileURLToPath(import.meta.url)), '..')
@@ -188,13 +190,17 @@ async function getTitle() {
   } catch { return null }
 }
 
-async function capturePane() {
-  const pane = await discoverPane()
-  if (!pane) return null
+async function capturePaneById(pane) {
   try {
     const { stdout } = await pexecFile('tmux', ['capture-pane', '-p', '-t', pane])
     return stdout
   } catch { return null }
+}
+
+async function capturePane() {
+  const pane = await discoverPane()
+  if (!pane) return null
+  return capturePaneById(pane)
 }
 
 // The sentinel the nudge submits. A bare Enter on an EMPTY prompt does NOT start a turn
@@ -202,16 +208,53 @@ async function capturePane() {
 // stalled) — the harness only drains the team inbox at TURN START, so the nudge must submit
 // an actual message. The empty-prompt gate guarantees we never clobber user-typed text, and
 // the cooldown caps this at one short sentinel turn per stall window.
-const WAKE_TEXT = process.env.WAKE_NUDGE_TEXT ||
-  '[wake-nudge] Your team inbox has a stalled backlog — process pending messages now.'
+// Newlines are stripped (review M1): a \n inside `-l` text would submit multiple turns.
+const WAKE_TEXT = (process.env.WAKE_NUDGE_TEXT ||
+  '[wake-nudge] Your team inbox has a stalled backlog — process pending messages now.')
+  .replace(/[\r\n]+/g, ' ').trim()
+
+function sleepMs(ms) { return new Promise((r) => setTimeout(r, ms)) }
 
 async function sendNudge() {
   const pane = await discoverPane()
   if (!pane) { log('sendNudge: no pane resolved, skipping'); return }
   if (DRY_RUN) { log(`DRY-RUN: would submit wake sentinel to pane ${pane}`); return }
-  // -l: type the sentinel literally (no key-name interpretation), then submit it.
-  await pexecFile('tmux', ['send-keys', '-t', pane, '-l', WAKE_TEXT])
-  await pexecFile('tmux', ['send-keys', '-t', pane, 'Enter'])
+
+  // TOCTOU race guard (review I1/I2): tick()'s prompt capture is several tmux round-trips old
+  // by now — the user could have started typing. Re-capture THIS pane (no re-discovery)
+  // immediately before typing and abort if the prompt is no longer empty. Fail-closed.
+  const pre = await capturePaneById(pane)
+  if (pre === null || !promptIsEmpty(pre)) {
+    log('sendNudge ABORTED: prompt no longer empty at send time (race guard) — no keys sent')
+    return
+  }
+
+  // '--' ends tmux option parsing so an operator-set WAKE_NUDGE_TEXT starting with '-' can't
+  // be misread as send-keys flags (review M1). -l types it literally (no key-name lookup).
+  await pexecFile('tmux', ['send-keys', '-t', pane, '-l', '--', WAKE_TEXT])
+
+  // Post-type verify (review I1 belt-and-suspenders): only press Enter if the prompt now
+  // contains EXACTLY the sentinel. Concurrent keystrokes / rendering surprises => leave the
+  // text unsubmitted (visible + editable — strictly safer than submitting a merged line) and
+  // log loudly. Retry briefly first: the UI may lag a beat before echoing the typed text.
+  let typed = null
+  for (let i = 0; i < 6; i++) {
+    await sleepMs(150)
+    typed = extractPromptText((await capturePaneById(pane)) ?? '')
+    if (typed === WAKE_TEXT) break
+  }
+  if (typed !== WAKE_TEXT) {
+    log(`sendNudge ABORTED before Enter: prompt reads ${JSON.stringify((typed || '').slice(0, 100))}, expected the sentinel — left unsubmitted, check pane ${pane}`)
+    return
+  }
+  try {
+    await pexecFile('tmux', ['send-keys', '-t', pane, 'Enter'])
+  } catch (err) {
+    // Sentinel is now sitting unsubmitted in the prompt; future empty-prompt gates will hold
+    // until it's cleared/submitted. Loud log so it's visible (review M2).
+    log(`sendNudge: Enter FAILED after typing sentinel — it remains in the prompt of ${pane}: ${err.message}`)
+    throw err
+  }
 }
 
 const deps = {
