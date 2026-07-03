@@ -1545,6 +1545,7 @@ async function checkForReplies() {
      let delivered = false
      let editSucceeded = false
      let overflowOk = true // caption-overflow trailing text (image branch) delivered?
+     let chosenAnchor = null // anchor this reply threads to; marked used on delivery
      try {
       const text = reply.text || reply.content || ''
       if (!text.trim()) {
@@ -1569,19 +1570,25 @@ async function checkForReplies() {
       const isFreshTs = (at) => typeof at === 'number' && at > 0 && (nowMs - at) <= THREAD_MAX_AGE_MS
       let replyToId = (lastUserMessageId && isFreshTs(lastUserMessageAt)) ? lastUserMessageId : null
       if (userMessageAnchors.length > 0) {
-        let bestAnchor = null
+        // Group = fresh anchors sharing the HIGHEST inboxCountAtSend <= replyIdx.
+        let bestCount = -1
         for (const anchor of userMessageAnchors) {
           if (!isFreshTs(anchor.at)) continue // stale/legacy anchor — never thread onto it
-          if (anchor.inboxCountAtSend <= replyIdx) {
-            if (!bestAnchor || anchor.inboxCountAtSend > bestAnchor.inboxCountAtSend) {
-              // Higher inboxCountAtSend — strictly better match
-              bestAnchor = anchor
-            }
-            // Same inboxCountAtSend — keep the first one (don't overwrite)
+          if (anchor.inboxCountAtSend <= replyIdx && anchor.inboxCountAtSend > bestCount) {
+            bestCount = anchor.inboxCountAtSend
           }
         }
-        if (bestAnchor) {
-          replyToId = bestAnchor.telegramMessageId
+        if (bestCount >= 0) {
+          const group = userMessageAnchors.filter(a => isFreshTs(a.at) && a.inboxCountAtSend === bestCount)
+          // Advance across rapid-fire messages: successive replies thread to successive
+          // UNUSED anchors in arrival order, instead of every reply piling onto the
+          // group's first message while later ones never get threaded (observed live
+          // 2026-07-03: "Are you getting my messages?" was answered but both replies
+          // threaded to the preceding "Test message 3:47pm"). Once every anchor in the
+          // group has been used, stick with the LAST (most recent) — ongoing progress
+          // updates keep threading to the message they follow from.
+          chosenAnchor = group.find(a => !a.used) || group[group.length - 1]
+          replyToId = chosenAnchor.telegramMessageId
         }
       }
 
@@ -1701,6 +1708,9 @@ async function checkForReplies() {
      }
 
      if (delivered) {
+       // Consume the anchor this reply threaded to, so the NEXT reply in a rapid-fire
+       // group advances to the next message. (Persisted by the batch-end saveMessageMap.)
+       if (chosenAnchor) chosenAnchor.used = true
        // Advance + persist immediately so the counter always reflects exactly what
        // has been relayed. A crash/kill/restart here resumes from the right offset.
        lastSentReplyCount = replyIdx + 1

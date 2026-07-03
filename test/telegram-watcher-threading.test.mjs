@@ -213,3 +213,39 @@ test('fresh inbound message: reply IS threaded to it and carries allow_sending_w
       'threaded sends must set allow_sending_without_reply so a bad target cannot block delivery')
   } finally { await stop(proc); dash.close(); server.close() }
 })
+
+// Rapid-fire regression (observed live 2026-07-03 21:50–21:53): user sent two messages
+// before any reply ("Test message 3:47pm" id=10821, then "Are you getting my messages?"
+// id=10822 — anchors share one inboxCountAtSend). BOTH replies threaded to 10821; 10822
+// never got a threaded answer. Successive replies must ADVANCE across the group's
+// anchors in arrival order (consuming each), not pile onto the first forever.
+test('rapid-fire messages: successive replies advance across anchors in order', async () => {
+  const { server, state, port } = await startMockTelegram()
+  const { server: dash, port: dashPort } = await startMockDashboard()
+  const home = makeHome()
+  writeMessageMap(home, {
+    _userMessageAnchors: [
+      { inboxCountAtSend: 0, telegramMessageId: 111, at: Date.now() },
+      { inboxCountAtSend: 0, telegramMessageId: 222, at: Date.now() },
+    ],
+  })
+  setTeamInbox(home, 'session-1', ['first answer'])
+  const proc = spawnWatcher(home, port, dashPort)
+  try {
+    assert.ok(await waitFor(() => state.sent.some(b => (b.text || '').includes('first answer'))), 'first reply delivered')
+    const r1 = state.sent.find(b => (b.text || '').includes('first answer'))
+    assert.equal(r1.reply_to_message_id, 111, 'first reply threads to the FIRST rapid-fire message')
+    // Escape the 5s edit-coalesce window so the second reply is a real sendMessage.
+    await sleep(5200)
+    appendTeamInbox(home, 'session-1', 'second answer')
+    assert.ok(await waitFor(() => state.sent.some(b => (b.text || '').includes('second answer'))), 'second reply delivered')
+    const r2 = state.sent.find(b => (b.text || '').includes('second answer'))
+    assert.equal(r2.reply_to_message_id, 222, 'second reply advances to the SECOND message, not the first again')
+    // A third reply after the group is exhausted stays on the LAST message (progress updates).
+    await sleep(5200)
+    appendTeamInbox(home, 'session-1', 'third update')
+    assert.ok(await waitFor(() => state.sent.some(b => (b.text || '').includes('third update'))), 'third reply delivered')
+    const r3 = state.sent.find(b => (b.text || '').includes('third update'))
+    assert.equal(r3.reply_to_message_id, 222, 'exhausted group keeps threading to the most recent message')
+  } finally { await stop(proc); dash.close(); server.close() }
+})
