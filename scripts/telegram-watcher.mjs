@@ -113,9 +113,15 @@ const MAX_ANCHORS = 200 // Keep anchors bounded
 // Reply-threading FRESHNESS GATE (2026-07-03 incident): never thread a reply onto a user
 // message older than this. Stale/mis-mapped reply_to targets (anchors surviving an
 // active-inbox switch pointed at a PRIOR session's messages) made watcher replies not
-// surface for the user, while a plain UN-threADED send demonstrably delivered. When a
+// surface for the user, while a plain un-threaded send demonstrably delivered. When a
 // threading target isn't provably fresh, send un-threaded — delivery beats threading.
-const THREAD_MAX_AGE_MS = Number(process.env.TG_THREAD_MAX_AGE_MS) || 30 * 60 * 1000
+// Env override TG_THREAD_MAX_AGE_MS: any finite value >= 0 is honored (0 disables
+// threading entirely); unset/empty/invalid falls back to the default.
+const THREAD_MAX_AGE_MS = (() => {
+  const raw = process.env.TG_THREAD_MAX_AGE_MS
+  const n = raw === undefined || raw === '' ? NaN : Number(raw)
+  return Number.isFinite(n) && n >= 0 ? n : 30 * 60 * 1000
+})()
 
 // Message editing: track last sent text message for rapid-fire reply coalescing
 let lastSentBotMessageId = null // Telegram message_id of the last text reply sent
