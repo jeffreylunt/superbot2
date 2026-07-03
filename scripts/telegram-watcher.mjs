@@ -527,7 +527,17 @@ async function sendMessage(text, opts = {}) {
     ...opts.replyMarkup ? { reply_markup: opts.replyMarkup } : {},
     ...opts.replyToMessageId ? { reply_to_message_id: opts.replyToMessageId, allow_sending_without_reply: true } : {},
   }
-  return tg('sendMessage', body)
+  try {
+    return await tg('sendMessage', body)
+  } catch (err) {
+    if (!isParseEntitiesError(err)) throw err
+    // Malformed HTML from the orchestrator's reply — resend as plain text so the
+    // user still gets the message instead of silence. (See htmlToPlainText.)
+    logError(`sendMessage rejected for bad HTML entities — resending as plain text: ${err.message}`)
+    const { parse_mode, ...plain } = body
+    plain.text = htmlToPlainText(text)
+    return tg('sendMessage', plain)
+  }
 }
 
 async function editMessageText(messageId, text, opts = {}) {
@@ -538,7 +548,15 @@ async function editMessageText(messageId, text, opts = {}) {
     parse_mode: opts.parseMode || 'HTML',
     ...opts.replyMarkup ? { reply_markup: opts.replyMarkup } : {},
   }
-  return tg('editMessageText', body)
+  try {
+    return await tg('editMessageText', body)
+  } catch (err) {
+    if (!isParseEntitiesError(err)) throw err
+    logError(`editMessageText rejected for bad HTML entities — resending as plain text: ${err.message}`)
+    const { parse_mode, ...plain } = body
+    plain.text = htmlToPlainText(text)
+    return tg('editMessageText', plain)
+  }
 }
 
 async function sendTypingAction() {
@@ -1211,6 +1229,26 @@ function escapeHtml(text) {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
+}
+
+// Telegram rejects an ENTIRE message with 400 "can't parse entities" when the
+// HTML we built (via markdownToTelegramHtml) has mismatched/overlapping tags —
+// e.g. interleaved <b>/<i> from overlapping markdown. That error is NOT
+// retryable (it fails identically every time), so without a fallback the reply
+// is silently dropped and the user sees no response. htmlToPlainText converts
+// our HTML back to readable plain text so a failed formatted send can be resent
+// WITHOUT parse_mode and still deliver the content (formatting lost, message not).
+function htmlToPlainText(text) {
+  return text
+    .replace(/<\/?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|a|blockquote|span|tg-spoiler)(?:\s[^>]*)?>/gi, '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, '&') // must be last so earlier entities don't double-decode
+}
+
+function isParseEntitiesError(err) {
+  return (err?.message || '').toLowerCase().includes("can't parse entities")
 }
 
 // Convert standard markdown (from orchestrator) to Telegram-safe HTML.
