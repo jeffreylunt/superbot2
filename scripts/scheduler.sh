@@ -172,6 +172,10 @@ echo "$RESULT" | jq -c '.[]' | while read -r JOB; do
   JOB_SPACE=$(echo "$JOB" | jq -r '.space // empty')
   JOB_DAYS=$(echo "$JOB" | jq -c '.days // []')
 
+  # Only post an inbox note if the job has a real task. Script-only jobs
+  # (script field set, task empty/absent) run silently — they self-report via
+  # their own logs, so they must not spam team-lead 48x/day.
+  if [[ -n "$JOB_TASK" && "$JOB_TASK" != "null" ]]; then
   MSG=$(jq -n \
     --arg from "scheduler" \
     --arg type "scheduled_job" \
@@ -191,13 +195,20 @@ echo "$RESULT" | jq -c '.[]' | while read -r JOB; do
   fi
 
   echo "$(date '+%Y-%m-%d %H:%M') - Scheduled: $JOB_NAME → team-lead inbox" >> "$LOG"
+  fi
 
   # Execute script if job has a "script" field (runs outside Claude Code, so claude -p works)
   JOB_SCRIPT=$(echo "$JOB" | jq -r '.script // empty')
   if [[ -n "$JOB_SCRIPT" ]]; then
-    # Validate script path: must be non-empty, resolve within SUPERBOT2_HOME, and exist
-    ALLOWED_BASE="$(cd "$DIR" && pwd)"
-    RESOLVED_SCRIPT="$(cd "$DIR" && realpath -m "$JOB_SCRIPT" 2>/dev/null || echo "")"
+    # Validate script path: must be non-empty, resolve within SUPERBOT2_HOME, and exist.
+    # pwd -P: canonicalize (resolve symlinks) so the containment check compares like with
+    # like — realpath() below returns the canonical path, and on macOS $TMPDIR/other dirs
+    # are often symlinks (/var -> /private/var), which made valid scripts look like escapes.
+    ALLOWED_BASE="$(cd "$DIR" && pwd -P)"
+    # Portable resolution: GNU `realpath -m` (Linux) resolves non-existent paths; BSD/macOS
+    # `realpath` lacks -m but resolves EXISTING files fine (the script must exist anyway). Try GNU
+    # first, fall back to BSD — backward-compatible, and existing task-based jobs never hit this path.
+    RESOLVED_SCRIPT="$(cd "$DIR" && { realpath -m "$JOB_SCRIPT" 2>/dev/null || realpath "$JOB_SCRIPT" 2>/dev/null; } || echo "")"
     if [[ -z "$RESOLVED_SCRIPT" ]]; then
       echo "$(date '+%Y-%m-%d %H:%M') - REJECTED script for $JOB_NAME: could not resolve path" >> "$LOG"
     elif [[ "$RESOLVED_SCRIPT" != "$ALLOWED_BASE"/* ]]; then
