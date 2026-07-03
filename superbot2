@@ -63,6 +63,49 @@ start_dashboard_ui() {
     fi
   done
 
+  # Reap ORPHANED dashboard trees that the port-kill above misses. When a prior launcher was
+  # SIGKILL'd (its EXIT trap never ran), its `concurrently`/`npm run dev`/`node --watch
+  # server.js` children get reparented to init (PPID 1) and survive — but they may no longer
+  # be the port LISTENER (e.g. the listener child died), so the lsof sweep leaves a duplicate,
+  # non-listening dashboard running.
+  #
+  # SAFETY: we must reap ONLY orphans from THIS repo's dashboard — never a co-resident
+  # dashboard from a different checkout, a ~/.otherbot install, or a user's own `npm run dev`
+  # dev session (which can be live and listening on different ports). Two guards on every
+  # candidate: (1) it must be ORPHANED (PPID 1) — a live launcher's children are off-limits;
+  # (2) its working directory must be under THIS REPO_DIR. The `node --watch ../dashboard/
+  # server.js` child runs with cwd=$REPO_DIR/dashboard-ui and a RELATIVE path in its argv, so
+  # cwd is the only reliable repo-scoping signal — a bare command-substring match is not.
+  proc_cwd() {
+    # Absolute cwd of $1, or empty. lsof is the portable way to read another proc's cwd on macOS.
+    lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1
+  }
+  is_orphaned_in_repo() {
+    local pid="$1"
+    [[ "$pid" == "$$" ]] && return 1
+    local ppid
+    ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    [[ "$ppid" == "1" ]] || return 1          # only true orphans
+    local cwd
+    cwd=$(proc_cwd "$pid")
+    [[ -n "$cwd" && "$cwd" == "$REPO_DIR"* ]] # only THIS repo
+  }
+  # `node --watch ../dashboard/server.js` orphans (the API server child).
+  for pid in $(pgrep -f "dashboard/server.js" 2>/dev/null); do
+    is_orphaned_in_repo "$pid" || continue
+    echo "Reaping orphaned dashboard server.js (PID $pid)..."
+    pkill -TERM -P "$pid" 2>/dev/null || true
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  # Orphaned `concurrently` launchers for this repo's dashboard-ui.
+  for pid in $(pgrep -f "dashboard-ui/node_modules/.bin/concurrently" 2>/dev/null); do
+    is_orphaned_in_repo "$pid" || continue
+    echo "Reaping orphaned dashboard concurrently (PID $pid)..."
+    pkill -TERM -P "$pid" 2>/dev/null || true
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  sleep 1
+
   echo "Starting dashboard → http://localhost:${ui_port}"
   (cd "$ui_dir" && SUPERBOT2_API_PORT="$api_port" SUPERBOT2_UI_PORT="$ui_port" npm run dev) >>/tmp/superbot2-dashboard-ui.log 2>&1 &
   DASHBOARD_UI_PID=$!
@@ -438,6 +481,39 @@ while true; do
   # kill the bash script before the restart loop runs.
   claude "${CLAUDE_ARGS[@]}" "$INITIAL_MSG" &
   CLAUDE_PID=$!
+
+  # Register `dashboard-user` in the active team as soon as the harness creates its
+  # config.json. The harness seeds each new session team with only team-lead as a member,
+  # so the orchestrator's SendMessage({to:'dashboard-user'}) reply path would otherwise be
+  # rejected until the watchdog's next poll. This short background poll makes the FIRST
+  # reply path ready within ~1s of the team appearing. Idempotent; the telegram watchdog is
+  # the steady-state backstop (see scripts/ensure-dashboard-user.mjs). Best-effort: never
+  # blocks claude, exits when claude exits.
+  (
+    for _ in $(seq 1 60); do
+      kill -0 "$CLAUDE_PID" 2>/dev/null || break
+      if node "$REPO_DIR/scripts/ensure-dashboard-user.mjs" 2>/dev/null; then
+        # Stop once dashboard-user is present in the active team's config.
+        if node -e '
+          const fs=require("fs"),path=require("path");
+          const teamsDir=path.join(process.env.SUPERBOT2_HOME,".claude","teams");
+          let teams=[]; try{teams=fs.readdirSync(teamsDir)}catch{process.exit(1)}
+          for(const t of teams){
+            try{
+              const c=JSON.parse(fs.readFileSync(path.join(teamsDir,t,"config.json"),"utf8"));
+              if(Array.isArray(c.members)&&c.members.some(m=>m&&m.name==="dashboard-user"))process.exit(0);
+            }catch{}
+          }
+          process.exit(1);
+        ' 2>/dev/null; then
+          break
+        fi
+      fi
+      sleep 1
+    done
+  ) &
+  ENSURE_DU_PID=$!
+
   # Anti-App-Nap / anti-idle-sleep companion: -d display, -i system idle,
   # -m disk idle, -s on AC, -u declares user activity. -w exits when claude
   # exits. Holding these assertions keeps the orchestrator from being throttled
@@ -446,11 +522,13 @@ while true; do
   CAFFEINATE_PID=$!
   wait "$CLAUDE_PID" || true
 
-  # Claude exited — clean up watchdog and caffeinate companion
+  # Claude exited — clean up watchdog, caffeinate companion, and the registration poll
   kill $WATCHDOG_PID 2>/dev/null
   wait $WATCHDOG_PID 2>/dev/null
   kill $CAFFEINATE_PID 2>/dev/null
   wait $CAFFEINATE_PID 2>/dev/null
+  kill $ENSURE_DU_PID 2>/dev/null
+  wait $ENSURE_DU_PID 2>/dev/null
 
   # Check if this was a restart request
   if [[ -f "$RESTART_FLAG" ]]; then

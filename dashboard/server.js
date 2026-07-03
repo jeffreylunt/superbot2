@@ -5166,6 +5166,13 @@ app.post('/api/messages', async (req, res) => {
       read: false,
     })
 
+    // Ensure the inbox directory exists before writing. During an orchestrator restart the
+    // active team can momentarily have no config.json (the launcher rm's the old one before
+    // the harness creates the new team), so the resolver falls back to a teams/<name>/inboxes
+    // path whose directory may not exist yet. Without this mkdir the writeFile throws ENOENT
+    // -> 500 -> the inbound user message is silently DROPPED (the 2026-06-25 14:29 outage,
+    // where Jeff's "I want it fixed" message was lost). mkdir -p makes the write resilient.
+    await mkdir(dirname(inboxPath), { recursive: true })
     await writeFile(inboxPath, JSON.stringify(existing, null, 2), 'utf-8')
 
     res.json({ ok: true })

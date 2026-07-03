@@ -9,7 +9,16 @@ echo "=== watchdog (bash) tests ==="
 bash "$DIR/telegram-watchdog.test.sh"
 
 echo
-echo "=== watcher (node) tests ==="
+echo "=== unit (node) tests ==="
 node --test --test-concurrency=1 \
+  "$DIR/active-team-inbox.test.mjs" \
+  "$DIR/ensure-dashboard-user.test.mjs" \
+  "$DIR/inbound-message-write.test.mjs"
+
+echo
+echo "=== watcher (node) integration tests ==="
+node --test --test-concurrency=1 \
+  "$DIR/telegram-watcher-active-inbox.test.mjs" \
+  "$DIR/telegram-watcher-typing.test.mjs" \
   "$DIR/telegram-watcher-tg.test.mjs" \
   "$DIR/telegram-watcher-nodrop.test.mjs"

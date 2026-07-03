@@ -15,8 +15,16 @@
 #     silent ~1h outage. See knowledge/telegram-outbound-stall.md.
 # Writes its own PID to ~/.superbot2/telegram-watchdog.pid for management.
 
+# Load node path resolved at install time (works across node managers / minimal PATHs).
+_SB_HOME_FOR_PATH="${SUPERBOT2_HOME:-$HOME/.superbot2}"
+[[ -f "$_SB_HOME_FOR_PATH/.node-path" ]] && export PATH="$(cat "$_SB_HOME_FOR_PATH/.node-path"):$PATH"
+export PATH="$HOME/.local/bin:$HOME/.asdf/shims:$HOME/.asdf/bin:$PATH"
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WATCHER_SCRIPT="${TELEGRAM_WATCHER_SCRIPT:-$SCRIPT_DIR/telegram-watcher.mjs}"
+# Registers `dashboard-user` into the active orchestrator team's config.json so the
+# orchestrator's SendMessage({to:'dashboard-user'}) reply path is valid across restarts.
+ENSURE_DASHBOARD_USER_SCRIPT="${ENSURE_DASHBOARD_USER_SCRIPT:-$SCRIPT_DIR/ensure-dashboard-user.mjs}"
 SUPERBOT_DIR="${SUPERBOT2_HOME:-$HOME/.superbot2}"
 CONFIG_FILE="$SUPERBOT_DIR/config.json"
 WATCHDOG_PID_FILE="$SUPERBOT_DIR/telegram-watchdog.pid"
@@ -66,6 +74,21 @@ telegram_enabled() {
       process.exit(c && c.telegram && c.telegram.enabled === false ? 1 : 0);
     } catch { process.exit(0); }
   ' "$CONFIG_FILE" 2>/dev/null
+}
+
+# Best-effort: ensure `dashboard-user` is a registered member of the ACTIVE orchestrator
+# team's config.json. The harness seeds each session team with only team-lead, so the
+# orchestrator's SendMessage({to:'dashboard-user'}) reply path is otherwise rejected after
+# every restart. Running this on the watchdog's poll cadence self-heals it within one cycle,
+# decoupled from the orchestrator process. Idempotent + always exits 0; never blocks the loop.
+ensure_dashboard_user() {
+  [ -f "$ENSURE_DASHBOARD_USER_SCRIPT" ] || return 0
+  command -v node >/dev/null 2>&1 || return 0
+  local out
+  out=$(SUPERBOT2_HOME="$SUPERBOT_DIR" node "$ENSURE_DASHBOARD_USER_SCRIPT" 2>&1) || true
+  # The CLI only prints when it actually changes the registry — forward that to the log.
+  [ -n "$out" ] && log "$out"
+  return 0
 }
 
 # Returns age in seconds of a heartbeat file (epoch-ms contents), or empty if absent/unreadable.
@@ -134,8 +157,14 @@ while true; do
   node "$WATCHER_SCRIPT" >> "$LOG_FILE" 2>&1 &
   CHILD_PID=$!
 
+  # Self-heal the orchestrator's reply path: register dashboard-user in the active team.
+  ensure_dashboard_user
+
   # Monitor loop: check child status and both heartbeats
   while true; do
+    # Keep dashboard-user registered (re-runs cheaply; only acts on a session-team change).
+    ensure_dashboard_user
+
     # Check if child is still running
     if ! kill -0 "$CHILD_PID" 2>/dev/null; then
       wait "$CHILD_PID" 2>/dev/null
