@@ -61,6 +61,31 @@ test('an empty prompt box is detected as empty', () => {
   assert.equal(promptIsEmpty(pane), true)
 })
 
+// With `capture-pane -e`, the TUI's greyed inline suggestion renders DIM (\x1b[2m).
+// Exact bytes observed live 2026-07-03: '\x1b[39m❯\xa0\x1b[2mblock the vrbo calendar
+// for those dates\x1b[0m' — arbitrary contextual text that a prefix allowlist can't
+// catch. It must read as EMPTY (it blocked real nudges and false-fired the
+// stuck-prompt Telegram alert).
+test('a DIM-styled inline suggestion counts as empty (escaped capture)', () => {
+  const pane = [
+    '──────────',
+    '\x1b[39m❯ \x1b[2mblock the vrbo calendar for those dates\x1b[0m',
+    '──────────',
+  ].join('\n')
+  assert.equal(extractPromptText(pane), '')
+  assert.equal(promptIsEmpty(pane), true)
+})
+
+test('real typed text in an escaped capture is still pending text, codes stripped', () => {
+  const pane = [
+    '──────────',
+    '\x1b[39m❯ relay the triage summaries\x1b[0m',
+    '──────────',
+  ].join('\n')
+  assert.equal(extractPromptText(pane), 'relay the triage summaries')
+  assert.equal(promptIsEmpty(pane), false)
+})
+
 test('a greyed placeholder counts as empty (not pending text)', () => {
   const pane = ['❯ Try "edit <filepath> to make a change"'].join('\n')
   assert.equal(extractPromptText(pane), '')

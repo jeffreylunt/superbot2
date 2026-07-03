@@ -192,7 +192,9 @@ async function getTitle() {
 
 async function capturePaneById(pane) {
   try {
-    const { stdout } = await pexecFile('tmux', ['capture-pane', '-p', '-t', pane])
+    // -e keeps SGR escapes so extractPromptText can tell DIM (greyed suggestion /
+    // placeholder) text from real user input — see the dim check in the dashboard lib.
+    const { stdout } = await pexecFile('tmux', ['capture-pane', '-e', '-p', '-t', pane])
     return stdout
   } catch { return null }
 }
