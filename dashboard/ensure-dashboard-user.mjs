@@ -80,6 +80,17 @@ function dashboardUserMember(teamName) {
 // Ensure `dashboard-user` is a member of the team config at `configPath`.
 // Returns one of: 'added' | 'present' | 'no-config' | 'parse-error'.
 // Pure file op against an explicit path — used directly by tests.
+//
+// Concurrency note: the read-modify-rename pattern is atomic with respect to READERS
+// (a concurrent reader never sees a partial write), but it is NOT safe against a
+// concurrent WRITER (e.g. the harness writing a just-spawned worker's member block
+// at the same moment). If both read the same snapshot, one writer's rename will
+// silently clobber the other's added member. This race window is narrow (the watchdog
+// only calls this once per poll cycle, and the harness rarely mutates config.json at
+// exactly the same instant), but callers should be aware that a concurrent harness
+// write can lose either dashboard-user or the newly spawned worker's block. Short-
+// circuiting the inner watchdog loop once "present" is observed (see telegram-watchdog.sh)
+// minimises re-entry and narrows this window further.
 export async function ensureDashboardUserInConfig(configPath) {
   let raw
   try {

@@ -88,7 +88,9 @@ start_dashboard_ui() {
     [[ "$ppid" == "1" ]] || return 1          # only true orphans
     local cwd
     cwd=$(proc_cwd "$pid")
-    [[ -n "$cwd" && "$cwd" == "$REPO_DIR"* ]] # only THIS repo
+    # Anchor at a path separator so a sibling checkout like "$REPO_DIR-staging" or
+    # "$REPO_DIR-worktree" is NOT matched — only exact-repo cwds qualify.
+    [[ -n "$cwd" && ( "$cwd" == "$REPO_DIR" || "$cwd" == "$REPO_DIR/"* ) ]] # only THIS repo
   }
   # `node --watch ../dashboard/server.js` orphans (the API server child).
   for pid in $(pgrep -f "dashboard/server.js" 2>/dev/null); do
