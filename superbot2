@@ -18,6 +18,13 @@ RESTART_FLAG="$DIR/.restart"
 LAUNCHER_PID=$$
 LAUNCHER_PID_FILE="$DIR/.launcher.pid"
 
+# Durable launcher log — survives the tmux window closing on exit. This is the
+# crash-forensics trail for the orchestrator (see stability-upgrades project):
+# every claude start, exit code, and pane tail at death lands here.
+LAUNCHER_LOG="$DIR/logs/launcher.log"
+mkdir -p "$DIR/logs" 2>/dev/null || true
+llog() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] launcher[$$]: $*" >> "$LAUNCHER_LOG" 2>/dev/null || true; }
+
 # ─── Single-instance guard ───
 # If another launcher is already running, kill it before starting a new one.
 # This prevents duplicate heartbeat triggers, etc.
@@ -25,6 +32,11 @@ if [[ -f "$LAUNCHER_PID_FILE" ]]; then
   OLD_PID=$(cat "$LAUNCHER_PID_FILE" 2>/dev/null || echo "")
   if [[ -n "$OLD_PID" ]] && [[ "$OLD_PID" != "$$" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
     echo "Found existing superbot2 launcher (PID $OLD_PID). Stopping it..."
+    # Forensics: THIS is one of only two code paths that deliberately kill the
+    # orchestrator claude process (the other is the .restart watchdog subshell).
+    # Record who invoked us so an automated caller murdering a healthy
+    # orchestrator can be identified from the log alone.
+    llog "single-instance guard KILLING old launcher pid=$OLD_PID (invoker: args='${*:-}' ppid=$PPID parent='$(ps -o command= -p $PPID 2>/dev/null | head -c 120 || true)')"
     # Kill the old launcher and all its child processes (claude, dashboard, watchdog)
     pkill -TERM -P "$OLD_PID" 2>/dev/null || true
     kill -TERM "$OLD_PID" 2>/dev/null || true
@@ -433,8 +445,12 @@ while true; do
   # Assemble fresh context each iteration
   PROMPT=$(assemble_prompt)
 
-  # Start watchdog: monitors for restart flag, kills claude when found
+  # Start watchdog: monitors for restart flag, kills claude when found.
+  # Side duty: every ~5 min, rotate the pane-mirror log if it grew huge (a long
+  # TUI session redraws constantly). Close-pipe → truncate → reopen, so the
+  # writer never holds a deleted inode. Failures here never affect the kill path.
   (
+    _tick=0
     while true; do
       sleep 1
       if [[ -f "$RESTART_FLAG" ]]; then
@@ -444,6 +460,15 @@ while true; do
         sleep 3
         pkill -KILL -P "$LAUNCHER_PID" 2>/dev/null || true
         exit 0
+      fi
+      _tick=$((_tick + 1))
+      if (( _tick % 300 == 0 )) && [[ -n "${TMUX_PANE:-}" ]]; then
+        _pane_log="$DIR/logs/orchestrator-pane.log"
+        if [[ -f "$_pane_log" ]] && (( $(stat -f%z "$_pane_log" 2>/dev/null || echo 0) > 50000000 )); then
+          tmux pipe-pane -t "$TMUX_PANE" 2>/dev/null || true
+          { tail -c 5000000 "$_pane_log" > "$_pane_log.tmp" 2>/dev/null && mv "$_pane_log.tmp" "$_pane_log"; } || true
+          tmux pipe-pane -o -t "$TMUX_PANE" "exec /bin/sh -c 'cat >> \"$_pane_log\"'" 2>/dev/null || true
+        fi
       fi
     done
   ) &
@@ -475,6 +500,25 @@ while true; do
   # Trigger heartbeat to seed inbox
   bash "$REPO_DIR/scripts/heartbeat-cron.sh" &
 
+  # ── Crash forensics: mirror everything this pane displays to a durable log.
+  # claude needs a real TTY (it's an interactive TUI), so we must NOT redirect
+  # its stdio. tmux pipe-pane taps the pane's output stream server-side instead:
+  # the TTY stays pristine and we still get every byte claude prints — including
+  # any dying error message that the closing window would otherwise swallow.
+  PANE_LOG="$DIR/logs/orchestrator-pane.log"
+  if [[ -n "${TMUX:-}" && -n "${TMUX_PANE:-}" ]]; then
+    # Rotate first (close the pipe so the writer doesn't keep the old inode).
+    if [[ -f "$PANE_LOG" ]] && (( $(stat -f%z "$PANE_LOG" 2>/dev/null || echo 0) > 20000000 )); then
+      tmux pipe-pane -t "$TMUX_PANE" 2>/dev/null || true   # close any open pipe
+      tail -c 2000000 "$PANE_LOG" > "$PANE_LOG.tmp" 2>/dev/null && mv "$PANE_LOG.tmp" "$PANE_LOG" || true
+    fi
+    # -o: only open if no pipe is already open (idempotent across loop iterations)
+    tmux pipe-pane -o -t "$TMUX_PANE" "exec /bin/sh -c 'cat >> \"$PANE_LOG\"'" 2>/dev/null \
+      || llog "WARN: tmux pipe-pane failed — pane output will not be mirrored"
+  else
+    llog "not inside tmux — pane mirroring and exit-screen capture unavailable"
+  fi
+
   # Run claude in the background so we can attach a caffeinate companion to its
   # PID. claude stays a DIRECT child of the launcher so the restart watchdog's
   # `pkill -P "$LAUNCHER_PID"` still terminates it correctly.
@@ -483,6 +527,7 @@ while true; do
   # kill the bash script before the restart loop runs.
   claude "${CLAUDE_ARGS[@]}" "$INITIAL_MSG" &
   CLAUDE_PID=$!
+  llog "claude STARTED pid=$CLAUDE_PID session=$SESSION_ID resume=$IS_RESTART pane=${TMUX_PANE:-none} binary=$(readlink "$(command -v claude 2>/dev/null)" 2>/dev/null || command -v claude 2>/dev/null || echo unknown)"
 
   # Register `dashboard-user` in the active team as soon as the harness creates its
   # config.json. The harness seeds each new session team with only team-lead as a member,
@@ -522,21 +567,48 @@ while true; do
   # when Terminal.app is unfocused/occluded (App Nap) or the machine idles.
   caffeinate -dimsu -w "$CLAUDE_PID" &
   CAFFEINATE_PID=$!
-  wait "$CLAUDE_PID" || true
+  CLAUDE_EXIT=0
+  wait "$CLAUDE_PID" || CLAUDE_EXIT=$?
 
-  # Claude exited — clean up watchdog, caffeinate companion, and the registration poll
-  kill $WATCHDOG_PID 2>/dev/null
-  wait $WATCHDOG_PID 2>/dev/null
-  kill $CAFFEINATE_PID 2>/dev/null
-  wait $CAFFEINATE_PID 2>/dev/null
-  kill $ENSURE_DU_PID 2>/dev/null
-  wait $ENSURE_DU_PID 2>/dev/null
+  # ── Crash forensics: persist HOW claude died before anything else can fail.
+  # Exit codes >128 mean death by signal (128+N): 143=SIGTERM (watchdog subshell,
+  # single-instance guard, or wedge kill), 137=SIGKILL, 129=SIGHUP (tmux window
+  # closed under it). A plain code means claude exited by itself — the case the
+  # crash-loop investigation needs the pane tail for.
+  EXIT_DETAIL="code=$CLAUDE_EXIT"
+  if (( CLAUDE_EXIT > 128 )); then
+    SIG_NAME=$(kill -l $((CLAUDE_EXIT - 128)) 2>/dev/null || echo "?")
+    EXIT_DETAIL="code=$CLAUDE_EXIT (signal SIG${SIG_NAME})"
+  fi
+  RESTART_FLAG_STATE="absent"
+  [[ -f "$RESTART_FLAG" ]] && RESTART_FLAG_STATE="present"
+  llog "claude EXITED $EXIT_DETAIL session=$SESSION_ID restart_flag=$RESTART_FLAG_STATE"
+  if [[ -n "${TMUX:-}" && -n "${TMUX_PANE:-}" ]]; then
+    {
+      echo "----- pane tail at claude exit ($(date -u +%Y-%m-%dT%H:%M:%SZ) session=$SESSION_ID $EXIT_DETAIL) -----"
+      tmux capture-pane -t "$TMUX_PANE" -p -S -80 2>/dev/null | sed -e 's/[[:space:]]*$//' | awk 'NF' | tail -40 || true
+      echo "----- end pane tail -----"
+    } >> "$LAUNCHER_LOG" 2>/dev/null || true
+  fi
+
+  # Claude exited — clean up watchdog, caffeinate companion, and the registration poll.
+  # Every step is || true-guarded: under set -e a failing kill/wait (e.g. wait
+  # reporting the SIGTERM we just delivered) would abort the launcher HERE and
+  # silently skip the restart check below, turning a graceful .restart into a
+  # full crash (new session id, lost context).
+  kill $WATCHDOG_PID 2>/dev/null || true
+  wait $WATCHDOG_PID 2>/dev/null || true
+  kill $CAFFEINATE_PID 2>/dev/null || true
+  wait $CAFFEINATE_PID 2>/dev/null || true
+  kill $ENSURE_DU_PID 2>/dev/null || true
+  wait $ENSURE_DU_PID 2>/dev/null || true
 
   # Check if this was a restart request
   if [[ -f "$RESTART_FLAG" ]]; then
     rm -f "$RESTART_FLAG"
     IS_RESTART=true
 
+    llog "restart flag present — relaunching claude with --resume $SESSION_ID"
     echo ""
     echo "Superbot2 restarting — resuming session $SESSION_ID"
     echo ""
@@ -544,6 +616,7 @@ while true; do
   fi
 
   # Normal exit
+  llog "no restart flag — launcher exiting (tmux window will close)"
   break
 done
 
