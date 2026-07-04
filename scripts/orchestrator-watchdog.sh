@@ -44,8 +44,11 @@ CAP_ALERT_FILE="$STATE_DIR/cap-alerted.txt"
 RESTART_FLAG="$DIR/.restart"
 LAUNCHER_PID_FILE="$DIR/.launcher.pid"
 # The distinctive argv prefix of the orchestrator claude process (workers have different
-# system prompts, so this cannot match them).
-ORCH_PATTERN="claude --system-prompt # Superbot2 Orchestrator"
+# system prompts, so this cannot match them). The [O] bracket keeps the REGEX from matching
+# OTHER pgrep/pkill/grep processes that carry this same pattern in their own argv — without
+# it, a concurrent monitoring pgrep makes orchestrator_alive() return a false ALIVE and the
+# watchdog never relaunches (observed live 2026-07-03 16:00Z during the crash test).
+ORCH_PATTERN="claude --system-prompt # Superbot2 [O]rchestrator"
 
 CHECK_INTERVAL="${OW_CHECK_INTERVAL:-30}"
 STARTUP_GRACE_S="${OW_STARTUP_GRACE_S:-180}"
@@ -111,14 +114,21 @@ alert_cap_hit_once() {
 
 relaunch_orchestrator() {
   if [ -n "${OW_RELAUNCH_CMD:-}" ]; then bash -c "$OW_RELAUNCH_CMD" >>"$LOG_FILE" 2>&1; return; fi
+  # -c "$HOME": the orchestrator MUST run with cwd=$HOME — that's the workspace claude
+  # trusts (a launchd-spawned tmux window otherwise inherits cwd=/ and claude BLOCKS on an
+  # interactive "trust this folder?" prompt — observed live 2026-07-03 16:02Z) and it's the
+  # cwd that maps to the -Users-jeff transcript dir the wake-nudge/health checks follow.
   if ! tmux list-sessions >/dev/null 2>&1; then
     log "no tmux server — creating detached session 'superbot2' running the launcher"
-    tmux new-session -d -s superbot2 "exec bash '$LAUNCHER'"
+    tmux new-session -d -s superbot2 -c "$HOME" "exec bash '$LAUNCHER'"
   else
     local sess
     sess=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | head -1)
     log "relaunching launcher in a new window of tmux session '$sess'"
-    tmux new-window -d -t "$sess" -n superbot2 "exec bash '$LAUNCHER'"
+    # Trailing colon: target the SESSION (next free window index). A bare "-t $sess" is
+    # parsed as window index when the session is numeric ("create window failed: index 0
+    # in use" — observed live 2026-07-03 16:00Z).
+    tmux new-window -d -t "${sess}:" -n superbot2 -c "$HOME" "exec bash '$LAUNCHER'"
   fi
 }
 
@@ -152,10 +162,30 @@ kill_orphan_claude() {
   pkill -TERM -f "$ORCH_PATTERN" 2>/dev/null || true
 }
 
+# Auto-confirm claude's startup dialogs (folder trust / bypass-permissions consent) after a
+# relaunch. They block boot while the process looks ALIVE, so without this an automated
+# recovery stalls forever at the dialog (observed live 2026-07-03 16:02Z). Safe: we always
+# relaunch the same $HOME workspace + repo config Jeff already trusts, and we only press
+# Enter when the health probe positively identifies a known boot dialog.
+accept_boot_dialog() {
+  local json dialog pane
+  json="$1"
+  dialog=$(echo "$json" | jq -r '.bootDialog' 2>/dev/null)
+  pane=$(echo "$json" | jq -r '.paneId // empty' 2>/dev/null)
+  [ "$dialog" = "true" ] && [ -n "$pane" ] || return 1
+  log "boot dialog detected in pane $pane — auto-confirming (Enter)"
+  if [ -n "${OW_ACCEPT_CMD:-}" ]; then bash -c "$OW_ACCEPT_CMD" >/dev/null 2>&1; else
+    tmux send-keys -t "$pane" Enter 2>/dev/null || true
+  fi
+  return 0
+}
+
 check_wedge() {
   local json backlog before prompt now last
   json=$(health_json)
   [ -n "$json" ] || return 0
+  # A blocked startup dialog is neither healthy nor a wedge — confirm it and move on.
+  if accept_boot_dialog "$json"; then return 0; fi
   backlog=$(echo "$json" | jq -r '.backlogAgeS // empty' 2>/dev/null)
   before=$(echo "$json" | jq -r '.transcriptBeforeBacklog' 2>/dev/null)
   prompt=$(echo "$json" | jq -r '.promptEmpty' 2>/dev/null)

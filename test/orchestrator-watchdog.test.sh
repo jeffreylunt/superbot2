@@ -130,6 +130,16 @@ run_case '
   [ ! -f "$RESTART_FLAG" ]
 ' && ok "no backlog => no wedge action" || bad "no backlog => no wedge action"
 
+# 11. Boot dialog detected => auto-confirm (Enter) and no wedge action
+run_case '
+  WEDGE_THRESHOLD_S=100
+  set_health "{\"paneFound\":true,\"paneId\":\"%9\",\"backlogAgeS\":500,\"transcriptAgeS\":600,\"transcriptBeforeBacklog\":true,\"promptEmpty\":false,\"bootDialog\":true}"
+  export OW_ACCEPT_CMD="touch \"$STATE_DIR/dialog-accepted\""
+  export OW_LAUNCHER_ALIVE_CMD="true"
+  check_wedge
+  [ -f "$STATE_DIR/dialog-accepted" ] && [ ! -f "$RESTART_FLAG" ]
+' && ok "boot dialog auto-confirmed, no wedge" || bad "boot dialog auto-confirmed, no wedge"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

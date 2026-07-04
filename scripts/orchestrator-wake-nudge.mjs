@@ -290,6 +290,14 @@ function acquireSingleton() {
 // --health: print a one-shot JSON liveness snapshot (for orchestrator-watchdog.sh wedge
 // detection) and exit. Reuses the exact same discovery/parsing as the nudge gates. Never
 // takes the singleton pidfile and never sends keys.
+// Startup dialogs that BLOCK an automated relaunch: the folder-trust "Quick safety check"
+// and the bypass-permissions consent. They render while the claude process is alive, so a
+// naive supervisor sees "alive" and stalls forever (observed live 2026-07-03 16:02Z: the
+// watchdog-relaunched orchestrator sat at the trust dialog). The health snapshot reports
+// them so orchestrator-watchdog.sh can auto-confirm (it relaunches the same trusted
+// $HOME + repo config every time).
+const BOOT_DIALOG_RE = /Quick safety check|Bypass Permissions mode|WARNING: Claude Code running in Bypass Permissions/i
+
 async function healthSnapshot() {
   const nowMs = Date.now()
   const backlogMs = await readInboxMtimeMs()
@@ -298,11 +306,13 @@ async function healthSnapshot() {
   const cap = pane ? await capturePaneById(pane) : null
   return {
     paneFound: !!pane,
+    paneId: pane || null,
     backlogAgeS: backlogMs == null ? null : Math.round((nowMs - backlogMs) / 1000),
     transcriptAgeS: transcriptMs == null ? null : Math.round((nowMs - transcriptMs) / 1000),
     // true = the orchestrator has NOT taken a turn since the newest unread message arrived
     transcriptBeforeBacklog: backlogMs != null && transcriptMs != null && transcriptMs < backlogMs,
     promptEmpty: cap != null && promptIsEmpty(cap),
+    bootDialog: cap != null && BOOT_DIALOG_RE.test(cap) && /Enter to confirm/.test(cap),
   }
 }
 
