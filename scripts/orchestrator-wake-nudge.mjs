@@ -304,6 +304,12 @@ async function healthSnapshot() {
   const transcriptMs = await readTranscriptMtimeMs()
   const pane = await discoverPane()
   const cap = pane ? await capturePaneById(pane) : null
+  // capturePaneById captures with -e (SGR escapes, needed by the dim-suggestion check in
+  // promptIsEmpty). The dialog phrases below are styled mid-phrase, so on the RAW capture
+  // "Enter to confirm" is not contiguous and the detection silently fails — observed live
+  // 2026-07-04: the watchdog never auto-confirmed and the orchestrator relaunch-looped at
+  // the trust dialog all night. Strip escapes before the phrase regexes.
+  const plainCap = cap == null ? null : cap.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')
   return {
     paneFound: !!pane,
     paneId: pane || null,
@@ -312,7 +318,7 @@ async function healthSnapshot() {
     // true = the orchestrator has NOT taken a turn since the newest unread message arrived
     transcriptBeforeBacklog: backlogMs != null && transcriptMs != null && transcriptMs < backlogMs,
     promptEmpty: cap != null && promptIsEmpty(cap),
-    bootDialog: cap != null && BOOT_DIALOG_RE.test(cap) && /Enter to confirm/.test(cap),
+    bootDialog: plainCap != null && BOOT_DIALOG_RE.test(plainCap) && /Enter to confirm/.test(plainCap),
   }
 }
 

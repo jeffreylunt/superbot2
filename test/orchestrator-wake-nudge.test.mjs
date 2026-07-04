@@ -285,3 +285,24 @@ test('tick treats a spinner title as mid-turn (no nudge)', async () => {
   assert.equal(out.decision.reason, 'spinner-active')
   assert.equal(calls.sendNudge, 0)
 })
+
+// --- boot-dialog detection on ESCAPED captures (live regression 2026-07-04) ---
+// capturePaneById captures with -e (SGR escapes, required by the dim-suggestion check).
+// The trust dialog styles mid-phrase, so "Enter to confirm" is NOT contiguous in the raw
+// capture and healthSnapshot's bootDialog silently reported false — the watchdog never
+// auto-confirmed and the orchestrator relaunch-looped at the dialog all night. The fixture
+// is the REAL escaped capture of that live dialog. Mirrors healthSnapshot's strip+regexes
+// (keep in lockstep with scripts/orchestrator-wake-nudge.mjs healthSnapshot()).
+test('boot dialog is detected on an escaped (-e) capture after stripping codes', async () => {
+  const { readFileSync } = await import('node:fs')
+  const { join, dirname } = await import('node:path')
+  const { fileURLToPath } = await import('node:url')
+  const raw = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures-boot-dialog-escaped.txt'), 'utf8')
+  const BOOT_DIALOG_RE = /Quick safety check|Bypass Permissions mode|WARNING: Claude Code running in Bypass Permissions/i
+  const plain = raw.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')
+  // The regression: on the raw capture the phrase check fails.
+  assert.equal(/Enter to confirm/.test(raw), false, 'fixture must reproduce the non-contiguous phrase')
+  // The fix: after stripping escapes, both checks pass -> bootDialog true.
+  assert.ok(BOOT_DIALOG_RE.test(plain), 'dialog phrase detected on stripped capture')
+  assert.ok(/Enter to confirm/.test(plain), 'confirm hint detected on stripped capture')
+})
