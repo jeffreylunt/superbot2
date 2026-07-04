@@ -36,7 +36,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import { resolveActiveTeamInboxesDir } from '../dashboard/active-team-inbox.mjs'
-import { tick, DEFAULT_CONFIG, newestUnreadMs, hasUnread, promptIsEmpty, extractPromptText } from '../dashboard/orchestrator-wake-nudge.mjs'
+import { tick, DEFAULT_CONFIG, newestUnreadMs, hasUnread, promptIsEmpty, extractPromptText, UNKNOWN_PROMPT } from '../dashboard/orchestrator-wake-nudge.mjs'
 
 const pexecFile = promisify(execFile)
 const REPO_DIR = join(dirname(fileURLToPath(import.meta.url)), '..')
@@ -340,9 +340,17 @@ async function sendStuckPromptAlert() {
   if (!tg.botToken || !tg.chatId) { log('stuck-prompt alert skipped: no telegram config'); return }
   const pane = await discoverPane()
   const pending = pane ? extractPromptText((await capturePaneById(pane)) ?? '') : ''
-  const text = `⚠️ Orchestrator wake-ups are blocked: unsubmitted text is sitting in its prompt box` +
-    (pending ? `:\n\n"${pending.slice(0, 120)}"` : '.') +
-    `\n\nMessages are piling up unread. Press Enter in the superbot2 tmux pane to submit it, or clear the line — wake-nudge will take over from there.`
+  // UNKNOWN_PROMPT means the pane had no readable prompt line at all — e.g. scrolled up
+  // in tmux copy-mode, or showing a dialog — NOT pending user text. Say so instead of
+  // leaking the internal sentinel to Jeff (which is exactly what happened 2026-07-04).
+  const unreadable = !pane || pending === UNKNOWN_PROMPT
+  const text = unreadable
+    ? `⚠️ Orchestrator wake-ups are blocked: I can't read its prompt box — the superbot2 ` +
+      `tmux pane may be scrolled up (press q to leave copy-mode) or showing a dialog. ` +
+      `Messages are piling up unread; check the pane.`
+    : `⚠️ Orchestrator wake-ups are blocked: unsubmitted text is sitting in its prompt box` +
+      (pending ? `:\n\n"${pending.slice(0, 120)}"` : '.') +
+      `\n\nMessages are piling up unread. Press Enter in the superbot2 tmux pane to submit it, or clear the line — wake-nudge will take over from there.`
   const res = await fetch(`https://api.telegram.org/bot${tg.botToken}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
