@@ -146,8 +146,24 @@ handle_dead_orchestrator() {
     return 0
   fi
   log "orchestrator DOWN (no '$ORCH_PATTERN' process) — relaunching (attempt $((count + 1))/$RELAUNCH_CAP in window)"
+  capture_crash_context
   record_relaunch
   relaunch_orchestrator
+}
+
+# Co-locate crash forensics with the DOWN event: the launcher's durable log now
+# records claude's exit code + on-screen tail at death (see superbot2 launcher),
+# so pull its last lines in here, plus the claude binary version (auto-update
+# churn is a crash-cause candidate). Best-effort only.
+capture_crash_context() {
+  {
+    echo "    claude binary: $(readlink "$HOME/.local/bin/claude" 2>/dev/null || echo unknown)"
+    if [ -f "$LOG_DIR/launcher.log" ]; then
+      tail -8 "$LOG_DIR/launcher.log" | sed 's/^/    launcher.log| /'
+    else
+      echo "    (no launcher.log yet — pre-instrumentation launcher)"
+    fi
+  } >> "$LOG_FILE" 2>/dev/null || true
 }
 
 # --- wedge detection --------------------------------------------------------------
@@ -246,6 +262,19 @@ ensure_companions() {
   done
 }
 
+# --- stranded-inbox migration ---------------------------------------------------------
+
+# Sweep unprocessed messages from dead session teams into the live session's inbox
+# (see dashboard/inbox-migration.mjs). Idempotent + fail-closed (no live orchestrator =>
+# no-op), so running it every supervision cycle is safe and delivers within ~CHECK_INTERVAL
+# of a new session registering. OW_SKIP_MIGRATE=1 disables (tests).
+run_inbox_migration() {
+  [ "${OW_SKIP_MIGRATE:-}" = "1" ] && return 0
+  [ -f "$SCRIPT_DIR/migrate-stranded-inbox.mjs" ] || return 0
+  command -v node >/dev/null 2>&1 || return 0
+  node "$SCRIPT_DIR/migrate-stranded-inbox.mjs" >>"$LOG_FILE" 2>&1 || true
+}
+
 # --- main -----------------------------------------------------------------------------
 
 run_main() {
@@ -269,6 +298,7 @@ run_main() {
       handle_dead_orchestrator
     fi
     ensure_companions
+    run_inbox_migration
     sleep "$CHECK_INTERVAL"
   done
 }

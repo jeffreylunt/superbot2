@@ -29,6 +29,7 @@ run_case() {
     export SUPERBOT2_HOME="$tmp"
     export OW_TEST_SOURCE=1
     export OW_SKIP_COMPANIONS=1
+    export OW_SKIP_MIGRATE=1
     source "$WATCHDOG"
     eval "$snippet"
   )

@@ -27,9 +27,16 @@ export async function realFileMtimeMs(filePath) {
 // - `pinnedTeam`: if set (and not the legacy 'superbot2' default), forces that team
 //   (back-compat / testing override).
 // - `fallbackInboxesDir`: returned when no live team is found.
+// - `scoreLeadInbox`: include inboxes/team-lead.json mtime in the freshness score
+//   (default true). team-lead.json is written by OTHER producers (scheduler, Telegram,
+//   dashboard), NOT by the team's own lead — so for consumers that need "which team is
+//   actually alive" (e.g. the stranded-inbox migration picking a replay DESTINATION),
+//   counting it is circular: a dead team keeps looking fresh precisely because of the
+//   misdelivered messages we're trying to move out of it. Those callers pass false and
+//   score only lead-authored signals (config.json, inboxes/dashboard-user.json).
 // Among teams with a real config.json, pick the one whose activity is freshest, scored by
-// the max mtime of {config.json, inboxes/dashboard-user.json, inboxes/team-lead.json}.
-export async function resolveActiveTeamInboxesDir(teamsDir, { pinnedTeam = '', fallbackInboxesDir = null } = {}) {
+// the max mtime of {config.json, inboxes/dashboard-user.json[, inboxes/team-lead.json]}.
+export async function resolveActiveTeamInboxesDir(teamsDir, { pinnedTeam = '', fallbackInboxesDir = null, scoreLeadInbox = true } = {}) {
   if (pinnedTeam && pinnedTeam !== 'superbot2') {
     return join(teamsDir, pinnedTeam, 'inboxes')
   }
@@ -48,7 +55,9 @@ export async function resolveActiveTeamInboxesDir(teamsDir, { pinnedTeam = '', f
     if (cfgMtime === null) continue // not a live/registered orchestrator team
     const inboxesDir = join(teamDir, 'inboxes')
     const dashMtime = (await realFileMtimeMs(join(inboxesDir, 'dashboard-user.json'))) ?? 0
-    const leadMtime = (await realFileMtimeMs(join(inboxesDir, 'team-lead.json'))) ?? 0
+    const leadMtime = scoreLeadInbox
+      ? ((await realFileMtimeMs(join(inboxesDir, 'team-lead.json'))) ?? 0)
+      : 0
     const score = Math.max(cfgMtime, dashMtime, leadMtime)
     if (!best || score > best.score) best = { inboxesDir, score }
   }
