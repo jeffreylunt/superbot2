@@ -38,7 +38,7 @@
 // text annotation and in originalTimestamp.
 
 import { createHash } from 'node:crypto'
-import { mkdir, readdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, readdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { resolveActiveTeamInboxesDir } from './active-team-inbox.mjs'
 
@@ -167,7 +167,31 @@ export async function migrateStrandedInboxes({
     if (team === destTeam) continue
     const teamDir = join(teamsDir, team)
     const inboxesDir = join(teamDir, 'inboxes')
-    const inbox = await readJson(join(inboxesDir, 'team-lead.json'))
+    const leadPath = join(inboxesDir, 'team-lead.json')
+
+    // A SYMLINKED team-lead.json is a compat ALIAS of another (usually the live) team's
+    // inbox — e.g. teams/superbot2/inboxes/*.json -> teams/session-<live>/inboxes/*.json,
+    // installed so legacy-path writers still reach the live orchestrator. It is NOT a
+    // stranded dead-team inbox. Reading through it makes the destination's own fresh
+    // messages look stranded and replays them into themselves — an infinite self-feeding
+    // annotation loop (observed live 2026-07-04 18:39–18:42Z, one nesting per watchdog
+    // cycle). Only REAL files are candidate sources; same-inode as the destination is
+    // also excluded as defense against hardlinks/aliasing.
+    let leadStat
+    try { leadStat = await lstat(leadPath) } catch { continue }
+    if (!leadStat.isFile()) {
+      log(`source ${team} team-lead.json is not a regular file (symlink alias?) — skipping`, 'debug')
+      continue
+    }
+    try {
+      const destStat = await stat(destInboxPath)
+      if (destStat.dev === leadStat.dev && destStat.ino === leadStat.ino) {
+        log(`source ${team} team-lead.json IS the destination inbox (aliased) — skipping`, 'debug')
+        continue
+      }
+    } catch { /* destination may not exist yet — fine */ }
+
+    const inbox = await readJson(leadPath)
     if (!Array.isArray(inbox) || inbox.length === 0) continue
 
     const lastLeadMs = await lastLeadActivityMs(inboxesDir)

@@ -2,7 +2,7 @@
 // Uses real tmp-dir team fixtures (no mocks of fs): the module's job IS the fs layout.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, rm, utimes, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { migrateStrandedInboxes, isControlMessage, messageId } from '../dashboard/inbox-migration.mjs'
@@ -240,6 +240,32 @@ test('unparseable destination inbox refuses to clobber', async () => {
   const result = await run()
   assert.equal(result.total, 0)
   assert.equal(await readFile(join(dest.inboxesDir, 'team-lead.json'), 'utf-8'), '{corrupt')
+})
+
+test('symlink-aliased source inbox is never treated as stranded (no self-replay loop)', async () => {
+  // Live incident 2026-07-04 18:39Z: teams/superbot2/inboxes/*.json were compat SYMLINKS
+  // into the live team's inboxes. Reading the "dead" team through the symlink made the
+  // live inbox's own fresh messages look stranded → they replayed into themselves with a
+  // new timestamp every watchdog cycle (infinite nesting). Symlinked sources must be skipped.
+  const dest = await makeTeam('session-live', {
+    configAgeMs: 0,
+    leadInbox: [msg('dashboard-user', new Date(NOW - 60_000).toISOString(), 'fresh live msg')],
+  })
+  const legacyDir = join(root, 'superbot2', 'inboxes')
+  await mkdir(legacyDir, { recursive: true })
+  await symlink(
+    join(dest.inboxesDir, 'team-lead.json'),
+    join(legacyDir, 'team-lead.json'),
+  )
+
+  const first = await run()
+  assert.equal(first.total, 0)
+  // and it stays stable across cycles (the loop was one replay per cycle)
+  const second = await run({ nowMs: NOW + 30_000 })
+  assert.equal(second.total, 0)
+  const inbox = await readInbox(dest.inboxesDir)
+  assert.equal(inbox.length, 1)
+  assert.equal(inbox[0].text, 'fresh live msg')
 })
 
 test('isControlMessage classification', () => {
