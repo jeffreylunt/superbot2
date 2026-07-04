@@ -24,8 +24,9 @@
 # scripts/install-orchestrator-watchdog.sh. Uninstall = `launchctl unload` that plist.
 # Env overrides (also used by test/orchestrator-watchdog.test.sh):
 #   OW_CHECK_INTERVAL, OW_STARTUP_GRACE_S, OW_WEDGE_THRESHOLD_S, OW_WEDGE_COOLDOWN_S,
-#   OW_RELAUNCH_CAP, OW_CAP_WINDOW_S, OW_ALIVE_CMD, OW_LAUNCHER_ALIVE_CMD, OW_HEALTH_CMD,
-#   OW_RELAUNCH_CMD, OW_KILL_ORPHAN_CMD, OW_SKIP_COMPANIONS=1, OW_TEST_SOURCE=1 (source only)
+#   OW_RELAUNCH_CAP, OW_CAP_WINDOW_S, OW_ALIVE_CMD, OW_ALIVE_RETRIES, OW_DOWN_CONFIRM,
+#   OW_LAUNCHER_ALIVE_CMD, OW_HEALTH_CMD, OW_RELAUNCH_CMD, OW_KILL_ORPHAN_CMD,
+#   OW_SKIP_COMPANIONS=1, OW_SKIP_MIGRATE=1, OW_TEST_SOURCE=1 (source only)
 set -u
 
 DIR="${SUPERBOT2_HOME:-$HOME/.superbot2}"
@@ -51,6 +52,8 @@ LAUNCHER_PID_FILE="$DIR/.launcher.pid"
 ORCH_PATTERN="claude --system-prompt # Superbot2 [O]rchestrator"
 
 CHECK_INTERVAL="${OW_CHECK_INTERVAL:-30}"
+ALIVE_RETRIES="${OW_ALIVE_RETRIES:-3}"
+DOWN_CONFIRM="${OW_DOWN_CONFIRM:-2}"
 STARTUP_GRACE_S="${OW_STARTUP_GRACE_S:-180}"
 WEDGE_THRESHOLD_S="${OW_WEDGE_THRESHOLD_S:-1800}"
 WEDGE_COOLDOWN_S="${OW_WEDGE_COOLDOWN_S:-3600}"
@@ -65,9 +68,41 @@ log() {
 
 # --- liveness -----------------------------------------------------------------
 
+# The orchestrator's argv carries the whole assembled system prompt (~300KB). macOS
+# argv reads (pgrep -f / ps -o command) fail INTERMITTENTLY on argv that large —
+# measured ~0.7% per probe against a healthy process, which at one probe per 30s cycle
+# produced ~20 false DOWNs/day, each of which relaunched the launcher whose
+# single-instance guard then MURDERED the healthy orchestrator (the entire 2026-07-03/04
+# "crash loop"). So liveness is now layered, and no single argv read can declare DOWN:
+#   1. argv pattern probe (authoritative when it succeeds),
+#   2. name-based probe: a CHILD of the live launcher that looks like claude — by
+#      comm (argv[0], "claude"; glitches at the same ~0.5% rate) OR by ucomm (true
+#      p_comm from kinfo_proc — ALWAYS readable — which for claude is the versioned
+#      binary basename, e.g. "2.1.201", resolved live from the install symlink),
+#   3. the whole chain retried with a pause (misses are transient and bursty).
+# ps+awk rather than pgrep -P/-x: macOS pgrep is also blind to any ANCESTOR of the
+# caller (verified live — it hides the orchestrator from every shell descended from
+# it); ps -axo always lists every pid.
+claude_child_of_launcher() {
+  local lpid bin
+  lpid=$(cat "$LAUNCHER_PID_FILE" 2>/dev/null || true)
+  [ -n "$lpid" ] || return 1
+  kill -0 "$lpid" 2>/dev/null || return 1
+  bin=$(basename "$(readlink "$HOME/.local/bin/claude" 2>/dev/null || true)" 2>/dev/null || true)
+  ps -axo pid=,ppid=,comm=,ucomm= 2>/dev/null \
+    | awk -v p="$lpid" -v b="$bin" \
+        '$2 == p && ($3 == "claude" || (b != "" && $4 == b)) { found = 1; exit } END { exit !found }'
+}
+
 orchestrator_alive() {
   if [ -n "${OW_ALIVE_CMD:-}" ]; then bash -c "$OW_ALIVE_CMD" >/dev/null 2>&1; return; fi
-  pgrep -f "$ORCH_PATTERN" >/dev/null 2>&1
+  local i
+  for ((i = 1; i <= ALIVE_RETRIES; i++)); do
+    pgrep -f "$ORCH_PATTERN" >/dev/null 2>&1 && return 0
+    claude_child_of_launcher && return 0
+    [ "$i" -lt "$ALIVE_RETRIES" ] && sleep 2
+  done
+  return 1
 }
 
 launcher_alive() {
@@ -277,6 +312,27 @@ run_inbox_migration() {
 
 # --- main -----------------------------------------------------------------------------
 
+# One supervision cycle. DOWN requires DOWN_CONFIRM consecutive cycles before any
+# relaunch: a real death stays down, so the only cost is CHECK_INTERVAL of extra
+# recovery latency — while a transient probe glitch (the false-DOWN murder mechanism
+# above) never survives two cycles ~30s apart.
+DOWN_STREAK=0
+supervise_cycle() {
+  if orchestrator_alive; then
+    DOWN_STREAK=0
+    check_wedge
+  else
+    DOWN_STREAK=$((DOWN_STREAK + 1))
+    if [ "$DOWN_STREAK" -ge "$DOWN_CONFIRM" ]; then
+      handle_dead_orchestrator
+    else
+      log "orchestrator not detected (probe miss $DOWN_STREAK/$DOWN_CONFIRM) — confirming next cycle before relaunching"
+    fi
+  fi
+  ensure_companions
+  run_inbox_migration
+}
+
 run_main() {
   # Singleton guard (mirrors telegram-watchdog): two supervisors would double-relaunch.
   if [ -f "$PID_FILE" ]; then
@@ -290,15 +346,9 @@ run_main() {
   echo $$ > "$PID_FILE"
   trap 'log "shutting down"; rm -f "$PID_FILE"; exit 0' SIGTERM SIGINT SIGHUP
 
-  log "starting (pid=$$ interval=${CHECK_INTERVAL}s wedge>${WEDGE_THRESHOLD_S}s cap=${RELAUNCH_CAP}/${CAP_WINDOW_S}s)"
+  log "starting (pid=$$ interval=${CHECK_INTERVAL}s wedge>${WEDGE_THRESHOLD_S}s cap=${RELAUNCH_CAP}/${CAP_WINDOW_S}s confirm=${DOWN_CONFIRM} probe-retries=${ALIVE_RETRIES})"
   while true; do
-    if orchestrator_alive; then
-      check_wedge
-    else
-      handle_dead_orchestrator
-    fi
-    ensure_companions
-    run_inbox_migration
+    supervise_cycle
     sleep "$CHECK_INTERVAL"
   done
 }

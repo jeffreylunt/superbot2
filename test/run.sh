@@ -13,6 +13,10 @@ echo "=== orchestrator-watchdog (bash) tests ==="
 bash "$DIR/orchestrator-watchdog.test.sh"
 
 echo
+echo "=== launcher single-instance guard (bash) tests ==="
+bash "$DIR/launcher-guard.test.sh"
+
+echo
 echo "=== unit (node) tests ==="
 node --test --test-concurrency=1 \
   "$DIR/active-team-inbox.test.mjs" \

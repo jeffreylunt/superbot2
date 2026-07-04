@@ -25,29 +25,6 @@ LAUNCHER_LOG="$DIR/logs/launcher.log"
 mkdir -p "$DIR/logs" 2>/dev/null || true
 llog() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] launcher[$$]: $*" >> "$LAUNCHER_LOG" 2>/dev/null || true; }
 
-# ─── Single-instance guard ───
-# If another launcher is already running, kill it before starting a new one.
-# This prevents duplicate heartbeat triggers, etc.
-if [[ -f "$LAUNCHER_PID_FILE" ]]; then
-  OLD_PID=$(cat "$LAUNCHER_PID_FILE" 2>/dev/null || echo "")
-  if [[ -n "$OLD_PID" ]] && [[ "$OLD_PID" != "$$" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
-    echo "Found existing superbot2 launcher (PID $OLD_PID). Stopping it..."
-    # Forensics: THIS is one of only two code paths that deliberately kill the
-    # orchestrator claude process (the other is the .restart watchdog subshell).
-    # Record who invoked us so an automated caller murdering a healthy
-    # orchestrator can be identified from the log alone.
-    llog "single-instance guard KILLING old launcher pid=$OLD_PID (invoker: args='${*:-}' ppid=$PPID parent='$(ps -o command= -p $PPID 2>/dev/null | head -c 120 || true)')"
-    # Kill the old launcher and all its child processes (claude, dashboard, watchdog)
-    pkill -TERM -P "$OLD_PID" 2>/dev/null || true
-    kill -TERM "$OLD_PID" 2>/dev/null || true
-    sleep 2
-    # Force kill if still alive
-    kill -9 "$OLD_PID" 2>/dev/null || true
-    echo "Old launcher stopped."
-  fi
-fi
-
-echo "$LAUNCHER_PID" > "$LAUNCHER_PID_FILE"
 DASHBOARD_UI_PID=""
 
 # ─── Dashboard UI ───
@@ -135,8 +112,6 @@ stop_dashboard_ui() {
     DASHBOARD_UI_PID=""
   fi
 }
-
-trap 'stop_dashboard_ui; rm -f "$LAUNCHER_PID_FILE"' EXIT
 
 # ─── Subcommands ───
 
@@ -249,6 +224,50 @@ case "${1:-}" in
     exit 0
     ;;
 esac
+
+# ─── Single-instance guard (LAUNCH PATH ONLY) ───
+# This must stay BELOW the subcommand block: it used to run before it, so ANY
+# invocation — including `superbot2 help` — killed the live orchestrator.
+#
+# Forensics: THIS is one of only two code paths that deliberately kill the
+# orchestrator claude process (the other is the .restart watchdog subshell).
+# Record who invoked us so an automated caller murdering a healthy orchestrator
+# can be identified from the log alone.
+if [[ -f "$LAUNCHER_PID_FILE" ]]; then
+  OLD_PID=$(cat "$LAUNCHER_PID_FILE" 2>/dev/null || echo "")
+  if [[ -n "$OLD_PID" ]] && [[ "$OLD_PID" != "$$" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
+    # A live claude CHILD of the old launcher means the orchestrator is ALIVE and
+    # this invocation is almost certainly a mistake (watchdog false-DOWN relaunch,
+    # stray automation) — refuse to replace it unless explicitly forced. ps+awk on
+    # pid/ppid/comm/ucomm (NOT pgrep, NOT an argv match): pgrep -f intermittently
+    # misses the orchestrator's ~300KB argv AND is blind to ancestors of the calling
+    # shell. comm (argv[0]) = "claude"; ucomm (p_comm, always readable) = the
+    # versioned binary basename (e.g. "2.1.201") — accept either.
+    CLAUDE_BIN_NAME=$(basename "$(readlink "$HOME/.local/bin/claude" 2>/dev/null || true)" 2>/dev/null || true)
+    OLD_CLAUDE_PIDS=$(ps -axo pid=,ppid=,comm=,ucomm= 2>/dev/null | awk -v p="$OLD_PID" -v b="$CLAUDE_BIN_NAME" '$2 == p && ($3 == "claude" || (b != "" && $4 == b)) { printf "%s ", $1 }' || true)
+    OLD_CLAUDE_PIDS="${OLD_CLAUDE_PIDS% }"
+    if [[ -n "$OLD_CLAUDE_PIDS" && "${SUPERBOT2_TAKEOVER:-}" != "1" ]]; then
+      echo "A superbot2 orchestrator is already RUNNING (launcher PID $OLD_PID, claude PID(s) $OLD_CLAUDE_PIDS)."
+      echo "Refusing to replace it."
+      echo "  To restart it gracefully (session preserved): touch $RESTART_FLAG"
+      echo "  To force a takeover (kills the running one):  SUPERBOT2_TAKEOVER=1 superbot2"
+      llog "single-instance guard REFUSED takeover: old launcher pid=$OLD_PID has live claude child(ren) $OLD_CLAUDE_PIDS (invoker: args='${*:-}' ppid=$PPID parent='$(ps -o command= -p $PPID 2>/dev/null | head -c 120 || true)')"
+      exit 1
+    fi
+    echo "Found existing superbot2 launcher (PID $OLD_PID). Stopping it..."
+    llog "single-instance guard KILLING old launcher pid=$OLD_PID claude_children='$OLD_CLAUDE_PIDS' takeover=${SUPERBOT2_TAKEOVER:-0} (invoker: args='${*:-}' ppid=$PPID parent='$(ps -o command= -p $PPID 2>/dev/null | head -c 120 || true)')"
+    # Kill the old launcher and all its child processes (claude, dashboard, watchdog)
+    pkill -TERM -P "$OLD_PID" 2>/dev/null || true
+    kill -TERM "$OLD_PID" 2>/dev/null || true
+    sleep 2
+    # Force kill if still alive
+    kill -9 "$OLD_PID" 2>/dev/null || true
+    echo "Old launcher stopped."
+  fi
+fi
+
+echo "$LAUNCHER_PID" > "$LAUNCHER_PID_FILE"
+trap 'stop_dashboard_ui; rm -f "$LAUNCHER_PID_FILE"' EXIT
 
 # ─── Guard: run setup if not initialized ───
 

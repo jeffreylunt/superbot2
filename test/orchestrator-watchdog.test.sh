@@ -141,6 +141,68 @@ run_case '
   [ -f "$STATE_DIR/dialog-accepted" ] && [ ! -f "$RESTART_FLAG" ]
 ' && ok "boot dialog auto-confirmed, no wedge" || bad "boot dialog auto-confirmed, no wedge"
 
+# 12. DOWN confirmation: a single probe miss must NOT relaunch (false-DOWN guard)
+run_case '
+  export OW_ALIVE_CMD="false"
+  export OW_RELAUNCH_CMD="touch \"$STATE_DIR/relaunched12\""
+  supervise_cycle
+  [ ! -f "$STATE_DIR/relaunched12" ]
+' && ok "single probe miss does not relaunch" || bad "single probe miss does not relaunch"
+
+# 13. DOWN confirmation: two consecutive misses => relaunch
+run_case '
+  export OW_ALIVE_CMD="false"
+  export OW_RELAUNCH_CMD="touch \"$STATE_DIR/relaunched13\""
+  supervise_cycle
+  supervise_cycle
+  [ -f "$STATE_DIR/relaunched13" ]
+' && ok "two consecutive misses relaunch" || bad "two consecutive misses relaunch"
+
+# 14. DOWN streak resets on an alive cycle: miss, alive, miss => no relaunch
+run_case '
+  export OW_ALIVE_CMD="[ -f \"$STATE_DIR/alive\" ]"
+  export OW_RELAUNCH_CMD="touch \"$STATE_DIR/relaunched14\""
+  set_health "{\"paneFound\":true,\"backlogAgeS\":null,\"transcriptAgeS\":5,\"transcriptBeforeBacklog\":false,\"promptEmpty\":true}"
+  supervise_cycle                 # miss (streak 1)
+  touch "$STATE_DIR/alive"
+  supervise_cycle                 # alive (streak resets)
+  rm -f "$STATE_DIR/alive"
+  supervise_cycle                 # miss (streak 1 again)
+  [ ! -f "$STATE_DIR/relaunched14" ]
+' && ok "alive cycle resets the DOWN streak" || bad "alive cycle resets the DOWN streak"
+
+# 15. Layered probe: pattern pgrep misses but a claude-named CHILD of the live launcher
+# exists => ALIVE. Fake launcher = a background subshell; fake claude = sleep exec'd
+# with argv[0]="claude" (comm — what the probe matches — is argv[0] on macOS; a copied
+# sleep BINARY named claude gets SIGKILL'd by AMFI, so exec -a is the only clean fake).
+run_case '
+  export OW_ALIVE_RETRIES=1; ALIVE_RETRIES=1
+  mkdir -p "$STATE_DIR/bin"
+  printf "#!/bin/bash\nexit 1\n" > "$STATE_DIR/bin/pgrep"; chmod +x "$STATE_DIR/bin/pgrep"
+  export PATH="$STATE_DIR/bin:$PATH"
+  ( bash -c "exec -a claude sleep 30" & echo $! > "$STATE_DIR/fake-claude.pid"; sleep 30 ) &
+  FAKE_LAUNCHER=$!
+  echo "$FAKE_LAUNCHER" > "$LAUNCHER_PID_FILE"
+  sleep 1
+  orchestrator_alive; rc=$?
+  kill "$FAKE_LAUNCHER" "$(cat "$STATE_DIR/fake-claude.pid" 2>/dev/null)" 2>/dev/null
+  [ $rc -eq 0 ]
+' && ok "claude-named launcher child counts as alive despite pgrep miss" || bad "claude-named launcher child counts as alive despite pgrep miss"
+
+# 16. Layered probe negative: launcher alive but NO claude child + pgrep miss => DOWN
+run_case '
+  export OW_ALIVE_RETRIES=1; ALIVE_RETRIES=1
+  mkdir -p "$STATE_DIR/bin"
+  printf "#!/bin/bash\nexit 1\n" > "$STATE_DIR/bin/pgrep"; chmod +x "$STATE_DIR/bin/pgrep"
+  export PATH="$STATE_DIR/bin:$PATH"
+  sleep 30 &
+  FAKE_LAUNCHER=$!
+  echo "$FAKE_LAUNCHER" > "$LAUNCHER_PID_FILE"
+  orchestrator_alive; rc=$?
+  kill "$FAKE_LAUNCHER" 2>/dev/null
+  [ $rc -ne 0 ]
+' && ok "no claude child + pgrep miss => down" || bad "no claude child + pgrep miss => down"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]
