@@ -38,13 +38,14 @@
 // text annotation and in originalTimestamp.
 
 import { createHash } from 'node:crypto'
-import { lstat, mkdir, readdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { resolveActiveTeamInboxesDir } from './active-team-inbox.mjs'
 
 export const DEFAULT_MAX_AGE_MS = 48 * 3600 * 1000
 export const DEFAULT_SOURCE_QUIET_MS = 10 * 60 * 1000
 export const DEFAULT_MAX_BATCH = 100
+export const DEFAULT_MAX_HOPS = 3
 
 const MARKER_BASENAME = '.inbox-migration-state.json'
 
@@ -52,6 +53,19 @@ export function messageId(m) {
   return createHash('sha256')
     .update(`${m.from ?? ''}|${m.timestamp ?? ''}|${m.text ?? ''}`)
     .digest('hex')
+}
+
+// How many times this message has already been replayed. Belt-and-braces against
+// self-feeding loops (live incident 2026-07-04 18:39Z): a replayed message that becomes
+// a candidate AGAIN (its dead destination rotated too) is re-delivered WITHOUT
+// re-annotation, and after maxHops replays it is dropped — so even a pathological
+// aliasing bug converges instead of nesting one wrapper per 30s cycle forever.
+export function migrationHopsOf(m) {
+  const n = Number(m.migrationHops)
+  if (Number.isFinite(n) && n > 0) return n
+  if (m.migratedFrom) return 1
+  if ((m.text || '').startsWith('[replayed ')) return 1
+  return 0
 }
 
 // Control/ephemeral chatter that must NOT be replayed into a new session: heartbeats are
@@ -123,6 +137,79 @@ function annotate(m, sourceTeam, nowMs) {
   )
 }
 
+// Filter one source inbox down to replayable candidates. Shared by the real-team and
+// shadow-team scans; `lastLeadMs` is the delivered-before cutoff (see header).
+function collectCandidates(inbox, { team, lastLeadMs, nowMs, maxAgeMs, maxHops, marker, log }) {
+  const candidates = []
+  for (const m of inbox) {
+    if (!m || m.read === true || isControlMessage(m)) continue
+    const ts = m.timestamp ? Date.parse(m.timestamp) : NaN
+    if (Number.isNaN(ts)) continue
+    if (ts <= lastLeadMs) continue // plausibly already delivered to the dead session
+    if (nowMs - ts > maxAgeMs) continue
+    const hops = migrationHopsOf(m)
+    if (hops >= maxHops) {
+      log(`loop guard: message from ${m.from} @ ${m.timestamp} in ${team} already replayed ${hops}x — dropping`, 'warn')
+      continue
+    }
+    const id = messageId(m)
+    if (marker.migrated[id]) continue
+    candidates.push({ m, ts, id, hops })
+  }
+  return candidates
+}
+
+// Snapshot the ACTIVE team's team-lead.json (plus the lead-activity cutoff, which
+// cannot survive a copy as mtimes) into shadowDir/<team>/. The harness DELETES a
+// session's team dir when claude exits gracefully — including on a takeover kill —
+// destroying any not-yet-delivered messages before the migration can see them. The
+// shadow, refreshed every supervision cycle while the team is alive, is what
+// migrateStrandedInboxes falls back to once the real dir has vanished (exposure
+// shrinks from "everything since the last turn" to at most one cycle interval).
+export async function snapshotActiveTeamInboxes({ teamsDir, shadowDir, nowMs = Date.now(), log = () => {} }) {
+  const inboxesDir = await resolveActiveTeamInboxesDir(teamsDir, { scoreLeadInbox: false })
+  if (!inboxesDir) return null
+  const team = basename(dirname(inboxesDir))
+  const leadPath = join(inboxesDir, 'team-lead.json')
+  let st
+  try {
+    st = await lstat(leadPath)
+  } catch {
+    return null // no inbox yet — nothing to shadow
+  }
+  if (!st.isFile()) return null // symlink alias — never snapshot through it
+
+  const outDir = join(shadowDir, team)
+  const metaPath = join(outDir, 'meta.json')
+  const prev = (await readJson(metaPath)) || {}
+  const lastLeadMs = await lastLeadActivityMs(inboxesDir)
+  if (prev.srcMtimeMs === st.mtimeMs && prev.lastLeadActivityMs === lastLeadMs) return team
+
+  if (prev.srcMtimeMs !== st.mtimeMs) {
+    let raw
+    try {
+      raw = await readFile(leadPath, 'utf-8')
+      JSON.parse(raw) // torn/concurrent read must never poison the shadow
+    } catch {
+      return null
+    }
+    await mkdir(join(outDir, 'inboxes'), { recursive: true })
+    const tmp = join(outDir, 'inboxes', `.team-lead.json.tmp-${process.pid}`)
+    await writeFile(tmp, raw, 'utf-8')
+    await rename(tmp, join(outDir, 'inboxes', 'team-lead.json'))
+  } else {
+    await mkdir(outDir, { recursive: true })
+  }
+  await writeJsonAtomic(metaPath, {
+    team,
+    snapshotAtMs: nowMs,
+    srcMtimeMs: st.mtimeMs,
+    lastLeadActivityMs: lastLeadMs,
+  })
+  log(`shadowed ${team} inbox (lead cutoff ${new Date(lastLeadMs).toISOString()})`, 'debug')
+  return team
+}
+
 // Main entry. Returns a summary { destination, migrated: [{sourceTeam, count}], total }.
 // Fail-closed: any precondition miss (no live orchestrator, no registered team,
 // unparseable destination inbox) migrates nothing.
@@ -133,6 +220,8 @@ export async function migrateStrandedInboxes({
   maxAgeMs = DEFAULT_MAX_AGE_MS,
   sourceQuietMs = DEFAULT_SOURCE_QUIET_MS,
   maxBatch = DEFAULT_MAX_BATCH,
+  maxHops = DEFAULT_MAX_HOPS,
+  shadowDir = null,
   dryRun = false,
   log = () => {},
 }) {
@@ -203,19 +292,42 @@ export async function migrateStrandedInboxes({
     const markerPath = join(teamDir, MARKER_BASENAME)
     const marker = (await readJson(markerPath)) || { migrated: {} }
 
-    const candidates = []
-    for (const m of inbox) {
-      if (!m || m.read === true || isControlMessage(m)) continue
-      const ts = m.timestamp ? Date.parse(m.timestamp) : NaN
-      if (Number.isNaN(ts)) continue
-      if (ts <= lastLeadMs) continue // plausibly already delivered to the dead session
-      if (nowMs - ts > maxAgeMs) continue
-      const id = messageId(m)
-      if (marker.migrated[id]) continue
-      candidates.push({ m, ts, id })
-    }
+    const candidates = collectCandidates(inbox, { team, lastLeadMs, nowMs, maxAgeMs, maxHops, marker, log })
     if (candidates.length === 0) continue
     perSource.push({ team, teamDir, markerPath, marker, candidates })
+  }
+
+  // Shadow sources: teams whose REAL dir the harness has already deleted (graceful
+  // claude exit) but which snapshotActiveTeamInboxes shadowed while they lived. A
+  // still-existing real dir always owns its own migration; the shadow only speaks for
+  // the dead. No source-quiet gate: a deleted team dir is definitively dead.
+  if (shadowDir) {
+    let shadowNames = []
+    try {
+      shadowNames = await readdir(shadowDir)
+    } catch { /* no shadows yet */ }
+    for (const team of shadowNames.sort()) {
+      if (team.startsWith('.') || team === destTeam || teamNames.includes(team)) continue
+      const teamDir = join(shadowDir, team)
+      const meta = await readJson(join(teamDir, 'meta.json'))
+      if (!meta) continue
+      if (nowMs - (meta.snapshotAtMs || 0) > maxAgeMs) {
+        if (!dryRun) await rm(teamDir, { recursive: true, force: true }).catch(() => {})
+        continue
+      }
+      const inbox = await readJson(join(teamDir, 'inboxes', 'team-lead.json'))
+      if (!Array.isArray(inbox) || inbox.length === 0) continue
+      const markerPath = join(teamDir, MARKER_BASENAME)
+      const marker = (await readJson(markerPath)) || { migrated: {} }
+      const candidates = collectCandidates(inbox, {
+        team,
+        lastLeadMs: meta.lastLeadActivityMs || 0,
+        nowMs, maxAgeMs, maxHops, marker, log,
+      })
+      if (candidates.length === 0) continue
+      log(`real team dir for ${team} is gone — replaying from its shadow snapshot`, 'debug')
+      perSource.push({ team, teamDir, markerPath, marker, candidates })
+    }
   }
 
   let all = perSource
@@ -255,11 +367,14 @@ export async function migrateStrandedInboxes({
   for (const c of all) {
     existing.push({
       ...c.m,
-      text: annotate(c.m, c.team, nowMs),
+      // A message that was ALREADY replayed once keeps its existing annotation —
+      // re-wrapping is what made the 18:39Z incident nest one prefix per cycle.
+      text: c.hops > 0 ? (c.m.text || '') : annotate(c.m, c.team, nowMs),
       timestamp: new Date(nowMs + seq++).toISOString(),
       read: false,
       migratedFrom: c.team,
-      originalTimestamp: c.m.timestamp,
+      originalTimestamp: c.m.originalTimestamp || c.m.timestamp,
+      migrationHops: c.hops + 1,
     })
   }
   await mkdir(destInboxesDir, { recursive: true })

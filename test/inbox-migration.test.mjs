@@ -5,7 +5,13 @@ import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, readFile, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { migrateStrandedInboxes, isControlMessage, messageId } from '../dashboard/inbox-migration.mjs'
+import {
+  migrateStrandedInboxes,
+  snapshotActiveTeamInboxes,
+  isControlMessage,
+  messageId,
+  migrationHopsOf,
+} from '../dashboard/inbox-migration.mjs'
 
 const NOW = Date.parse('2026-07-04T06:00:00.000Z')
 const HOUR = 3600 * 1000
@@ -266,6 +272,131 @@ test('symlink-aliased source inbox is never treated as stranded (no self-replay 
   const inbox = await readInbox(dest.inboxesDir)
   assert.equal(inbox.length, 1)
   assert.equal(inbox[0].text, 'fresh live msg')
+})
+
+test('already-replayed message is re-delivered WITHOUT re-wrapping (double rotation)', async () => {
+  // Replayed into session-mid, which died unprocessed too. It must reach the new live
+  // team exactly once more, with its ORIGINAL annotation intact — the 18:39Z incident
+  // was one extra "[replayed ...]" nesting per cycle.
+  const wrapped = '[replayed 2026-07-04T05:00:00.000Z from dead session session-old — originally sent 2026-07-04T04:55:00.000Z; delivery was delayed by a session restart, so this may be stale: use judgment before acting]\n\nhello orchestrator'
+  await makeTeam('session-mid', {
+    configAgeMs: 20 * HOUR,
+    leadInbox: [msg('dashboard-user', '2026-07-04T05:00:00.000Z', wrapped, {
+      migratedFrom: 'session-old',
+      originalTimestamp: '2026-07-04T04:55:00.000Z',
+      migrationHops: 1,
+    })],
+    otherInboxes: { 'dashboard-user.json': { ageMs: 2 * HOUR } },
+  })
+  const dest = await makeTeam('session-live', { leadInbox: [] })
+
+  const result = await run()
+  assert.equal(result.total, 1)
+  const inbox = await readInbox(dest.inboxesDir)
+  assert.equal(inbox[0].text, wrapped) // NOT re-wrapped
+  assert.equal(inbox[0].migrationHops, 2)
+  assert.equal(inbox[0].migratedFrom, 'session-mid')
+  assert.equal(inbox[0].originalTimestamp, '2026-07-04T04:55:00.000Z')
+  // and never nests further even across repeated cycles
+  const again = await run({ nowMs: NOW + 30_000 })
+  assert.equal(again.total, 0)
+})
+
+test('hop cap drops a message replayed maxHops times (loop convergence)', async () => {
+  await makeTeam('session-dead', {
+    configAgeMs: 20 * HOUR,
+    leadInbox: [
+      msg('dashboard-user', '2026-07-04T05:00:00.000Z', 'ping-ponged too often', { migrationHops: 3 }),
+      msg('dashboard-user', '2026-07-04T05:01:00.000Z', 'fresh one'),
+    ],
+    otherInboxes: { 'dashboard-user.json': { ageMs: 2 * HOUR } },
+  })
+  const dest = await makeTeam('session-live', { leadInbox: [] })
+
+  const result = await run()
+  assert.equal(result.total, 1)
+  const inbox = await readInbox(dest.inboxesDir)
+  assert.match(inbox[0].text, /fresh one$/)
+})
+
+test('dangling symlink source (target team dir deleted) is skipped without error', async () => {
+  const legacyDir = join(root, 'superbot2', 'inboxes')
+  await mkdir(legacyDir, { recursive: true })
+  await symlink(
+    join(root, 'session-deleted', 'inboxes', 'team-lead.json'), // does not exist
+    join(legacyDir, 'team-lead.json'),
+  )
+  const dest = await makeTeam('session-live', { leadInbox: [] })
+
+  const result = await run()
+  assert.equal(result.total, 0)
+  assert.equal((await readInbox(dest.inboxesDir)).length, 0)
+})
+
+test('shadow snapshot replays a team whose real dir was deleted (rotation ordering fix)', async () => {
+  const shadowDir = join(root, '.inbox-shadow')
+  // Live team with one processed and one stranded message; lead last active 2h ago.
+  const live = await makeTeam('session-a', {
+    configAgeMs: 0,
+    leadInbox: [
+      msg('dashboard-user', '2026-07-03T20:00:00.000Z', 'processed long ago'),
+      msg('dashboard-user', '2026-07-04T05:30:00.000Z', 'arrived after last turn'),
+    ],
+    otherInboxes: { 'dashboard-user.json': { ageMs: 2 * HOUR } },
+  })
+  const snapped = await snapshotActiveTeamInboxes({ teamsDir: root, shadowDir, nowMs: NOW })
+  assert.equal(snapped, 'session-a')
+
+  // Rotation: harness deletes the team dir; a new session registers.
+  await rm(live.teamDir, { recursive: true, force: true })
+  const dest = await makeTeam('session-b', { leadInbox: [] })
+
+  const result = await run({ shadowDir })
+  assert.equal(result.total, 1)
+  const inbox = await readInbox(dest.inboxesDir)
+  assert.match(inbox[0].text, /replayed .* from dead session session-a/)
+  assert.match(inbox[0].text, /arrived after last turn$/)
+
+  // Idempotent across cycles (durable marker lives in the shadow dir).
+  const again = await run({ shadowDir, nowMs: NOW + 30_000 })
+  assert.equal(again.total, 0)
+})
+
+test('shadow is ignored while the real team dir still exists', async () => {
+  const shadowDir = join(root, '.inbox-shadow')
+  await makeTeam('session-a', {
+    configAgeMs: 0,
+    leadInbox: [msg('dashboard-user', '2026-07-04T05:30:00.000Z', 'not stranded — team alive')],
+    otherInboxes: { 'dashboard-user.json': { ageMs: 2 * HOUR } },
+  })
+  await snapshotActiveTeamInboxes({ teamsDir: root, shadowDir, nowMs: NOW })
+
+  // session-a is still the live destination — its own shadow must not feed back into it.
+  const result = await run({ shadowDir })
+  assert.equal(result.total, 0)
+})
+
+test('stale shadow (older than maxAge) is pruned, not replayed', async () => {
+  const shadowDir = join(root, '.inbox-shadow')
+  const live = await makeTeam('session-a', {
+    configAgeMs: 0,
+    leadInbox: [msg('dashboard-user', '2026-07-04T05:30:00.000Z', 'ancient stranded msg')],
+    otherInboxes: { 'dashboard-user.json': { ageMs: 2 * HOUR } },
+  })
+  await snapshotActiveTeamInboxes({ teamsDir: root, shadowDir, nowMs: NOW - 72 * HOUR })
+  await rm(live.teamDir, { recursive: true, force: true })
+  await makeTeam('session-b', { leadInbox: [] })
+
+  const result = await run({ shadowDir })
+  assert.equal(result.total, 0)
+  await assert.rejects(readFile(join(shadowDir, 'session-a', 'meta.json')))
+})
+
+test('migrationHopsOf infers hops from field, marker fields, and text prefix', () => {
+  assert.equal(migrationHopsOf(msg('u', '2026-07-04T05:00:00.000Z', 'plain')), 0)
+  assert.equal(migrationHopsOf(msg('u', '2026-07-04T05:00:00.000Z', 'x', { migrationHops: 2 })), 2)
+  assert.equal(migrationHopsOf(msg('u', '2026-07-04T05:00:00.000Z', 'x', { migratedFrom: 't' })), 1)
+  assert.equal(migrationHopsOf(msg('u', '2026-07-04T05:00:00.000Z', '[replayed 2026-07-04T05:00:00.000Z from dead session x — originally sent y]\n\nz')), 1)
 })
 
 test('isControlMessage classification', () => {

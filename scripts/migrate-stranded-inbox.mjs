@@ -8,6 +8,7 @@
 // errors unless --verbose. Env overrides:
 //   SUPERBOT2_HOME          base dir (default ~/.superbot2)
 //   MIGRATE_TEAMS_DIR       teams dir (default $SUPERBOT2_HOME/.claude/teams)
+//   MIGRATE_SHADOW_DIR      shadow-snapshot dir (default $SUPERBOT2_HOME/.inbox-shadow)
 //   MIGRATE_ALIVE_CMD       liveness probe command (default pgrep for the orchestrator)
 //   MIGRATE_MAX_AGE_H       max message age to replay, hours (default 48)
 //   MIGRATE_SOURCE_QUIET_S  source team must be quiet this long, seconds (default 600)
@@ -18,6 +19,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import {
   migrateStrandedInboxes,
+  snapshotActiveTeamInboxes,
   DEFAULT_MAX_AGE_MS,
   DEFAULT_SOURCE_QUIET_MS,
   DEFAULT_MAX_BATCH,
@@ -25,6 +27,7 @@ import {
 
 const HOME_DIR = process.env.SUPERBOT2_HOME || join(homedir(), '.superbot2')
 const TEAMS_DIR = process.env.MIGRATE_TEAMS_DIR || join(HOME_DIR, '.claude', 'teams')
+const SHADOW_DIR = process.env.MIGRATE_SHADOW_DIR || join(HOME_DIR, '.inbox-shadow')
 
 // Same distinctive argv prefix orchestrator-watchdog.sh matches; the [O] keeps our own
 // argv (and other monitors') from matching. ps+grep rather than pgrep -f: macOS pgrep
@@ -42,15 +45,33 @@ function logLine(msg, level = 'info') {
   console.log(`[${new Date().toISOString()}] inbox-migration: ${msg}`)
 }
 
-function orchestratorAlive() {
+function aliveProbe() {
   return new Promise((resolve) => {
     execFile('bash', ['-c', ALIVE_CMD], (err) => resolve(!err))
   })
 }
 
+// The ps/grep probe reads the orchestrator's ~300KB argv, which macOS intermittently
+// fails to return (~0.7%/read — the same glitch behind the watchdog false-DOWN crash
+// loop). A false "dead" here is fail-closed (holds one cycle), but retrying makes the
+// hold-a-cycle case vanishingly rare.
+async function orchestratorAlive() {
+  for (let i = 0; i < 3; i++) {
+    if (await aliveProbe()) return true
+    await new Promise((r) => setTimeout(r, 1500))
+  }
+  return false
+}
+
 try {
+  // Shadow first, so the freshest possible copy exists before any rotation deletes the
+  // real team dir (the harness removes it on graceful claude exit).
+  if (!dryRun) {
+    await snapshotActiveTeamInboxes({ teamsDir: TEAMS_DIR, shadowDir: SHADOW_DIR, log: logLine })
+  }
   const result = await migrateStrandedInboxes({
     teamsDir: TEAMS_DIR,
+    shadowDir: SHADOW_DIR,
     isOrchestratorAlive: orchestratorAlive,
     maxAgeMs: (Number(process.env.MIGRATE_MAX_AGE_H) || DEFAULT_MAX_AGE_MS / 3600e3) * 3600e3,
     sourceQuietMs: (Number(process.env.MIGRATE_SOURCE_QUIET_S) || DEFAULT_SOURCE_QUIET_MS / 1000) * 1000,
