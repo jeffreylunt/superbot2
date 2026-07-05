@@ -41,7 +41,8 @@ TEAMS_DIR="$CLAUDE_DIR/teams"
 # every run. Mirror dashboard/active-team-inbox.mjs: among teams with a REAL config.json,
 # pick the one whose activity (config.json / inbox files) is freshest. An explicit
 # SUPERBOT2_NAME other than the legacy 'superbot2' default forces that team.
-TEAM_DIR=$(node -e "
+resolve_team_dir() {
+  node -e "
 const fs = require('fs'), path = require('path');
 const teamsDir = process.argv[1], pinned = process.argv[2];
 function realMtime(p) { try { const st = fs.lstatSync(p); if (st.isSymbolicLink() || !st.isFile()) return null; return st.mtimeMs; } catch { return null; } }
@@ -59,7 +60,9 @@ for (const t of teams) {
   if (!best || score > best.score) best = { dir, score };
 }
 if (best) process.stdout.write(best.dir);
-" "$TEAMS_DIR" "$SUPERBOT2_NAME")
+" "$TEAMS_DIR" "$SUPERBOT2_NAME"
+}
+TEAM_DIR=$(resolve_team_dir)
 
 # Exit silently if no live orchestrator team was found
 [[ -z "$TEAM_DIR" || ! -f "$TEAM_DIR/config.json" ]] && exit 0
@@ -158,11 +161,55 @@ fs.writeFileSync(process.argv[2], JSON.stringify(lastRun, null, 2));
 if (due.length > 0) console.log(JSON.stringify(due));
 " "$SCHEDULE" "$LAST_RUN" "$NOW_HOUR" "$NOW_MIN" "$NOW_DAY" "$NOW_DATE" "$NOW_DOM" "$NOW_MONTH" 2>> "$LOG")
 
+# ── Lossless delivery ──────────────────────────────────────────────────────────
+# The team dir resolved at script start can be DELETED mid-run: session rotation
+# replaces team dirs, and on 2026-07-04 09:00 MT three scheduled_job messages died
+# against the vanished session-7d562e09 ("No such file or directory" at the inbox
+# redirect) — silently lost, because lastRun was already marked so they never
+# re-fired. Delivery now (a) re-resolves the active team AT WRITE TIME per message,
+# (b) falls back to recreating the start-of-run team dir (the stranded-inbox
+# migration sweeps it to the live team within ~30s), and (c) dead-letters anything
+# that still can't be written, redelivered automatically on later scheduler runs.
+DEAD_LETTER="$DIR/scheduler-dead-letter.jsonl"
+
+# deliver_to_inbox MSG_JSON -> prints the inbox path written on success, rc=1 on failure
+deliver_to_inbox() {
+  local msg="$1" team_dir inbox
+  team_dir=$(resolve_team_dir 2>/dev/null || true)
+  [[ -z "$team_dir" || ! -d "$team_dir" ]] && team_dir="$TEAM_DIR"
+  inbox="$team_dir/inboxes/team-lead.json"
+  mkdir -p "$team_dir/inboxes" 2>/dev/null || true
+  if [[ -f "$inbox" ]] && jq -e '. | type == "array"' "$inbox" >/dev/null 2>&1; then
+    if locked_write "$inbox" '. + [$msg]' --argjson msg "$msg"; then
+      echo "$inbox"; return 0
+    fi
+  elif echo "[$msg]" > "$inbox" 2>/dev/null; then
+    echo "$inbox"; return 0
+  fi
+  return 1
+}
+
+# Redeliver anything a previous run dead-lettered (runs even when no job is due now).
+if [[ -s "$DEAD_LETTER" ]]; then
+  DL_REMAINING=$(mktemp)
+  while IFS= read -r DL_MSG; do
+    [[ -z "$DL_MSG" ]] && continue
+    if DL_INBOX=$(deliver_to_inbox "$DL_MSG"); then
+      echo "$(date '+%Y-%m-%d %H:%M') - Redelivered dead-lettered message → $DL_INBOX" >> "$LOG"
+    else
+      echo "$DL_MSG" >> "$DL_REMAINING"
+    fi
+  done < "$DEAD_LETTER"
+  if [[ -s "$DL_REMAINING" ]]; then
+    mv "$DL_REMAINING" "$DEAD_LETTER"
+  else
+    rm -f "$DL_REMAINING" "$DEAD_LETTER"
+  fi
+fi
+
 [[ -z "$RESULT" ]] && exit 0
 
 # Drop each due job as a notification in team-lead's inbox
-INBOX="$TEAM_DIR/inboxes/team-lead.json"
-
 echo "$RESULT" | jq -c '.[]' | while read -r JOB; do
   JOB_NAME=$(echo "$JOB" | jq -r '.name')
   JOB_TASK=$(echo "$JOB" | jq -r '.task')
@@ -188,13 +235,12 @@ echo "$RESULT" | jq -c '.[]' | while read -r JOB; do
       --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
       '{from: $from, type: $type, text: $text, summary: $summary, metadata: {jobName: $jobName, scheduledTime: $jobTime, space: (if $jobSpace != "" then $jobSpace else null end), days: $jobDays}, timestamp: $ts, read: false}')
 
-    if [[ -f "$INBOX" ]] && jq -e '. | type == "array"' "$INBOX" >/dev/null 2>&1; then
-      locked_write "$INBOX" '. + [$msg]' --argjson msg "$MSG"
+    if TARGET_INBOX=$(deliver_to_inbox "$MSG"); then
+      echo "$(date '+%Y-%m-%d %H:%M') - Scheduled: $JOB_NAME → $TARGET_INBOX" >> "$LOG"
     else
-      echo "[$MSG]" > "$INBOX"
+      echo "$MSG" | jq -c '.' >> "$DEAD_LETTER" 2>/dev/null || echo "$MSG" >> "$DEAD_LETTER"
+      echo "$(date '+%Y-%m-%d %H:%M') - DELIVERY FAILED for $JOB_NAME — dead-lettered to $DEAD_LETTER (will retry next run)" >> "$LOG"
     fi
-
-    echo "$(date '+%Y-%m-%d %H:%M') - Scheduled: $JOB_NAME → team-lead inbox" >> "$LOG"
   fi
 
   # Execute script if job has a "script" field (runs outside Claude Code, so claude -p works)
@@ -217,7 +263,16 @@ echo "$RESULT" | jq -c '.[]' | while read -r JOB; do
       echo "$(date '+%Y-%m-%d %H:%M') - REJECTED script for $JOB_NAME: file not found ($RESOLVED_SCRIPT)" >> "$LOG"
     else
       echo "$(date '+%Y-%m-%d %H:%M') - Executing script for $JOB_NAME: $RESOLVED_SCRIPT" >> "$LOG"
-      (bash "$RESOLVED_SCRIPT" >> "$LOG" 2>&1 &)
+      # Spawn in a NEW SESSION, not a plain background subshell. Under launchd a
+      # backgrounded child shares this script's process group, and launchd SIGKILLs
+      # that whole group the moment this script exits (AbandonProcessGroup defaults
+      # to false) — the child died mid-run before its work completed (every
+      # jedd-sweep dispatch was silently killed 2026-06-29→07-04 while this log
+      # still said "Executing"). macOS ships no setsid(1); perl's POSIX::setsid is
+      # the portable equivalent. The sleep keeps this script alive past the child's
+      # setsid() call so the group-kill can never land in the fork→setsid window.
+      /usr/bin/perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' /bin/bash "$RESOLVED_SCRIPT" </dev/null >> "$LOG" 2>&1 &
+      sleep 1
     fi
   fi
 done

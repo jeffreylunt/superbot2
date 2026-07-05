@@ -61,6 +61,31 @@ test('an empty prompt box is detected as empty', () => {
   assert.equal(promptIsEmpty(pane), true)
 })
 
+// With `capture-pane -e`, the TUI's greyed inline suggestion renders DIM (\x1b[2m).
+// Exact bytes observed live 2026-07-03: '\x1b[39m❯\xa0\x1b[2mblock the vrbo calendar
+// for those dates\x1b[0m' — arbitrary contextual text that a prefix allowlist can't
+// catch. It must read as EMPTY (it blocked real nudges and false-fired the
+// stuck-prompt Telegram alert).
+test('a DIM-styled inline suggestion counts as empty (escaped capture)', () => {
+  const pane = [
+    '──────────',
+    '\x1b[39m❯ \x1b[2mblock the vrbo calendar for those dates\x1b[0m',
+    '──────────',
+  ].join('\n')
+  assert.equal(extractPromptText(pane), '')
+  assert.equal(promptIsEmpty(pane), true)
+})
+
+test('real typed text in an escaped capture is still pending text, codes stripped', () => {
+  const pane = [
+    '──────────',
+    '\x1b[39m❯ relay the triage summaries\x1b[0m',
+    '──────────',
+  ].join('\n')
+  assert.equal(extractPromptText(pane), 'relay the triage summaries')
+  assert.equal(promptIsEmpty(pane), false)
+})
+
 test('a greyed placeholder counts as empty (not pending text)', () => {
   const pane = ['❯ Try "edit <filepath> to make a change"'].join('\n')
   assert.equal(extractPromptText(pane), '')
@@ -259,4 +284,25 @@ test('tick treats a spinner title as mid-turn (no nudge)', async () => {
   assert.equal(out.decision.nudge, false)
   assert.equal(out.decision.reason, 'spinner-active')
   assert.equal(calls.sendNudge, 0)
+})
+
+// --- boot-dialog detection on ESCAPED captures (live regression 2026-07-04) ---
+// capturePaneById captures with -e (SGR escapes, required by the dim-suggestion check).
+// The trust dialog styles mid-phrase, so "Enter to confirm" is NOT contiguous in the raw
+// capture and healthSnapshot's bootDialog silently reported false — the watchdog never
+// auto-confirmed and the orchestrator relaunch-looped at the dialog all night. The fixture
+// is the REAL escaped capture of that live dialog. Mirrors healthSnapshot's strip+regexes
+// (keep in lockstep with scripts/orchestrator-wake-nudge.mjs healthSnapshot()).
+test('boot dialog is detected on an escaped (-e) capture after stripping codes', async () => {
+  const { readFileSync } = await import('node:fs')
+  const { join, dirname } = await import('node:path')
+  const { fileURLToPath } = await import('node:url')
+  const raw = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures-boot-dialog-escaped.txt'), 'utf8')
+  const BOOT_DIALOG_RE = /Quick safety check|Bypass Permissions mode|WARNING: Claude Code running in Bypass Permissions/i
+  const plain = raw.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')
+  // The regression: on the raw capture the phrase check fails.
+  assert.equal(/Enter to confirm/.test(raw), false, 'fixture must reproduce the non-contiguous phrase')
+  // The fix: after stripping escapes, both checks pass -> bootDialog true.
+  assert.ok(BOOT_DIALOG_RE.test(plain), 'dialog phrase detected on stripped capture')
+  assert.ok(/Enter to confirm/.test(plain), 'confirm hint detected on stripped capture')
 })

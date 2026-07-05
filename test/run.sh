@@ -9,12 +9,21 @@ echo "=== watchdog (bash) tests ==="
 bash "$DIR/telegram-watchdog.test.sh"
 
 echo
+echo "=== orchestrator-watchdog (bash) tests ==="
+bash "$DIR/orchestrator-watchdog.test.sh"
+
+echo
+echo "=== launcher single-instance guard (bash) tests ==="
+bash "$DIR/launcher-guard.test.sh"
+
+echo
 echo "=== unit (node) tests ==="
 node --test --test-concurrency=1 \
   "$DIR/active-team-inbox.test.mjs" \
   "$DIR/ensure-dashboard-user.test.mjs" \
   "$DIR/inbound-message-write.test.mjs" \
-  "$DIR/orchestrator-wake-nudge.test.mjs"
+  "$DIR/orchestrator-wake-nudge.test.mjs" \
+  "$DIR/inbox-migration.test.mjs"
 
 echo
 echo "=== watcher (node) integration tests ==="

@@ -36,7 +36,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import { resolveActiveTeamInboxesDir } from '../dashboard/active-team-inbox.mjs'
-import { tick, DEFAULT_CONFIG, newestUnreadMs, hasUnread, promptIsEmpty, extractPromptText } from '../dashboard/orchestrator-wake-nudge.mjs'
+import { tick, DEFAULT_CONFIG, newestUnreadMs, hasUnread, promptIsEmpty, extractPromptText, UNKNOWN_PROMPT } from '../dashboard/orchestrator-wake-nudge.mjs'
 
 const pexecFile = promisify(execFile)
 const REPO_DIR = join(dirname(fileURLToPath(import.meta.url)), '..')
@@ -192,7 +192,9 @@ async function getTitle() {
 
 async function capturePaneById(pane) {
   try {
-    const { stdout } = await pexecFile('tmux', ['capture-pane', '-p', '-t', pane])
+    // -e keeps SGR escapes so extractPromptText can tell DIM (greyed suggestion /
+    // placeholder) text from real user input — see the dim check in the dashboard lib.
+    const { stdout } = await pexecFile('tmux', ['capture-pane', '-e', '-p', '-t', pane])
     return stdout
   } catch { return null }
 }
@@ -285,7 +287,103 @@ function acquireSingleton() {
   process.on('SIGTERM', () => { cleanup(); process.exit(0) })
 }
 
+// --health: print a one-shot JSON liveness snapshot (for orchestrator-watchdog.sh wedge
+// detection) and exit. Reuses the exact same discovery/parsing as the nudge gates. Never
+// takes the singleton pidfile and never sends keys.
+// Startup dialogs that BLOCK an automated relaunch: the folder-trust "Quick safety check"
+// and the bypass-permissions consent. They render while the claude process is alive, so a
+// naive supervisor sees "alive" and stalls forever (observed live 2026-07-03 16:02Z: the
+// watchdog-relaunched orchestrator sat at the trust dialog). The health snapshot reports
+// them so orchestrator-watchdog.sh can auto-confirm (it relaunches the same trusted
+// $HOME + repo config every time).
+const BOOT_DIALOG_RE = /Quick safety check|Bypass Permissions mode|WARNING: Claude Code running in Bypass Permissions/i
+
+async function healthSnapshot() {
+  const nowMs = Date.now()
+  const backlogMs = await readInboxMtimeMs()
+  const transcriptMs = await readTranscriptMtimeMs()
+  const pane = await discoverPane()
+  const cap = pane ? await capturePaneById(pane) : null
+  // capturePaneById captures with -e (SGR escapes, needed by the dim-suggestion check in
+  // promptIsEmpty). The dialog phrases below are styled mid-phrase, so on the RAW capture
+  // "Enter to confirm" is not contiguous and the detection silently fails — observed live
+  // 2026-07-04: the watchdog never auto-confirmed and the orchestrator relaunch-looped at
+  // the trust dialog all night. Strip escapes before the phrase regexes.
+  const plainCap = cap == null ? null : cap.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')
+  return {
+    paneFound: !!pane,
+    paneId: pane || null,
+    backlogAgeS: backlogMs == null ? null : Math.round((nowMs - backlogMs) / 1000),
+    transcriptAgeS: transcriptMs == null ? null : Math.round((nowMs - transcriptMs) / 1000),
+    // true = the orchestrator has NOT taken a turn since the newest unread message arrived
+    transcriptBeforeBacklog: backlogMs != null && transcriptMs != null && transcriptMs < backlogMs,
+    promptEmpty: cap != null && promptIsEmpty(cap),
+    bootDialog: plainCap != null && BOOT_DIALOG_RE.test(plainCap) && /Enter to confirm/.test(plainCap),
+  }
+}
+
+// --- stuck-prompt Telegram alert --------------------------------------------
+// 'prompt-not-empty' is decideNudge's FINAL gate: that reason means a stalled backlog
+// exists, the orchestrator is idle, cooldown has passed — and ONLY unsubmitted text in
+// the prompt box is blocking the wake. By design we never clobber that text, which means
+// a forgotten half-typed command silently blocks ALL wake-ups indefinitely (bit Jeff
+// twice on 2026-07-03: Telegram tests went unanswered for 40+ min each time). After
+// PROMPT_ALERT_TICKS consecutive blocked ticks, tell Jeff on Telegram — plain text via
+// the bot API directly (no parse_mode, nothing to fail), once per stuck episode.
+const PROMPT_ALERT_TICKS = Number(process.env.WAKE_NUDGE_PROMPT_ALERT_TICKS) || 24 // ~2 min at 5s polls
+let promptBlockedTicks = 0
+let promptAlertSent = false
+
+async function sendStuckPromptAlert() {
+  const cfgPath = join(SUPERBOT2_HOME, 'config.json')
+  const tg = JSON.parse(await readFile(cfgPath, 'utf8')).telegram || {}
+  if (!tg.botToken || !tg.chatId) { log('stuck-prompt alert skipped: no telegram config'); return }
+  const pane = await discoverPane()
+  const pending = pane ? extractPromptText((await capturePaneById(pane)) ?? '') : ''
+  // UNKNOWN_PROMPT means the pane had no readable prompt line at all — e.g. scrolled up
+  // in tmux copy-mode, or showing a dialog — NOT pending user text. Say so instead of
+  // leaking the internal sentinel to Jeff (which is exactly what happened 2026-07-04).
+  const unreadable = !pane || pending === UNKNOWN_PROMPT
+  const text = unreadable
+    ? `⚠️ Orchestrator wake-ups are blocked: I can't read its prompt box — the superbot2 ` +
+      `tmux pane may be scrolled up (press q to leave copy-mode) or showing a dialog. ` +
+      `Messages are piling up unread; check the pane.`
+    : `⚠️ Orchestrator wake-ups are blocked: unsubmitted text is sitting in its prompt box` +
+      (pending ? `:\n\n"${pending.slice(0, 120)}"` : '.') +
+      `\n\nMessages are piling up unread. Press Enter in the superbot2 tmux pane to submit it, or clear the line — wake-nudge will take over from there.`
+  const res = await fetch(`https://api.telegram.org/bot${tg.botToken}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: tg.chatId, text }),
+    signal: AbortSignal.timeout(15000),
+  })
+  const json = await res.json()
+  if (!json.ok) throw new Error(json.description || 'sendMessage not ok')
+}
+
+async function trackStuckPrompt(reason) {
+  if (reason !== 'prompt-not-empty') {
+    // Episode over (text submitted/cleared, or some other gate took precedence) — re-arm.
+    promptBlockedTicks = 0
+    promptAlertSent = false
+    return
+  }
+  promptBlockedTicks++
+  if (promptAlertSent || promptBlockedTicks < PROMPT_ALERT_TICKS) return
+  promptAlertSent = true // latch first: even a failed send shouldn't spam every tick
+  try {
+    await sendStuckPromptAlert()
+    log(`stuck-prompt ALERT sent to Telegram after ${promptBlockedTicks} blocked ticks`)
+  } catch (err) {
+    log(`stuck-prompt alert FAILED (will not retry this episode): ${err.message}`)
+  }
+}
+
 async function main() {
+  if (args.includes('--health')) {
+    process.stdout.write(JSON.stringify(await healthSnapshot()) + '\n')
+    return
+  }
   let lastNudgeMs = null
   log(`starting (dry-run=${DRY_RUN} once=${ONCE} forcedPane=${FORCED_PANE || '(auto)'} pollMs=${config.pollMs})`)
   const runOne = async () => {
@@ -293,6 +391,7 @@ async function main() {
       const out = await tick(deps, config, lastNudgeMs)
       lastNudgeMs = out.lastNudgeMs
       if (!out.decision.nudge) log(`tick: no-nudge (${out.decision.reason})`)
+      await trackStuckPrompt(out.decision.reason)
     } catch (err) {
       log(`tick error (fail-closed): ${err.message}`)
     }
