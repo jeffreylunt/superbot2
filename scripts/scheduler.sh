@@ -263,7 +263,16 @@ echo "$RESULT" | jq -c '.[]' | while read -r JOB; do
       echo "$(date '+%Y-%m-%d %H:%M') - REJECTED script for $JOB_NAME: file not found ($RESOLVED_SCRIPT)" >> "$LOG"
     else
       echo "$(date '+%Y-%m-%d %H:%M') - Executing script for $JOB_NAME: $RESOLVED_SCRIPT" >> "$LOG"
-      (bash "$RESOLVED_SCRIPT" >> "$LOG" 2>&1 &)
+      # Spawn in a NEW SESSION, not a plain background subshell. Under launchd a
+      # backgrounded child shares this script's process group, and launchd SIGKILLs
+      # that whole group the moment this script exits (AbandonProcessGroup defaults
+      # to false) — the child died mid-run before its work completed (every
+      # jedd-sweep dispatch was silently killed 2026-06-29→07-04 while this log
+      # still said "Executing"). macOS ships no setsid(1); perl's POSIX::setsid is
+      # the portable equivalent. The sleep keeps this script alive past the child's
+      # setsid() call so the group-kill can never land in the fork→setsid window.
+      /usr/bin/perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' /bin/bash "$RESOLVED_SCRIPT" </dev/null >> "$LOG" 2>&1 &
+      sleep 1
     fi
   fi
 done
