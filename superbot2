@@ -494,9 +494,16 @@ while true; do
   WATCHDOG_PID=$!
 
   # Build claude args
+  # --model: the orchestrator ALWAYS runs on Opus (Jeff, 2026-07-05). It must never
+  # inherit a Fable/other default from ~/.claude/settings.json — because cwd=$HOME, that
+  # project-level settings file overrides CLAUDE_CONFIG_DIR and silently pinned Fable 5,
+  # which hit its usage limit and wedged the orchestrator (couldn't take a turn; Telegram
+  # backed up). An explicit flag wins over settings and survives restarts. Workers pick
+  # their own model per task via spawn-worker.sh --model (default opus).
   CLAUDE_ARGS=(
     --system-prompt "$PROMPT"
     --session-id "$SESSION_ID"
+    --model "${SUPERBOT2_ORCH_MODEL:-opus}"
     --dangerously-skip-permissions
   )
 

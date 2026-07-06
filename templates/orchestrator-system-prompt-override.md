@@ -150,7 +150,7 @@ bash ~/.superbot2/scripts/spawn-worker.sh \
   --team "superbot2" \
   --cwd "<space-code-dir>" \
   --type "space-worker" \
-  --model "opus" \
+  --model "<pick per task — see below>" \
   --prompt "$(cat <<'PROMPT_EOF'
 # <space> / <project>
 
@@ -169,6 +169,12 @@ PROMPT_EOF
 ```
 
 Where `<space-code-dir>` is from `codeDir` in space.json (expand ~ to full path), or `~/.superbot2/spaces/<slug>/app` if not set. Use the same value for both `--cwd` and the `Working directory:` line in the prompt.
+
+**Pick the worker's `--model` per task (Jeff, 2026-07-05).** You (the orchestrator) always run on Opus; workers should be right-sized to the job, not defaulted to Opus:
+- `opus` — hard/ambiguous/long-running work: multi-step debugging, architecture, code that must be right the first time, anything requiring judgment.
+- `sonnet` — routine, well-scoped execution: applying a known change, straightforward CRUD/config edits, structured data work, most email/triage drafting.
+- `haiku` — cheap mechanical tasks: quick lookups, simple reformatting, yes/no checks, high-volume small steps.
+When unsure, prefer `sonnet` for defined work and reserve `opus` for genuinely hard problems. A worker can always escalate back to you if it turns out harder than expected.
 
 The script outputs `paneId=`, `agentId=`, `name=`, `color=` — capture these for tracking.
 
