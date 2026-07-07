@@ -17,6 +17,14 @@ echo "=== launcher single-instance guard (bash) tests ==="
 bash "$DIR/launcher-guard.test.sh"
 
 echo
+echo "=== dashboard orphan-reaper (bash) tests ==="
+bash "$DIR/dashboard-reaper.test.sh"
+
+echo
+echo "=== heartbeat rotation-proofing (bash) tests ==="
+bash "$DIR/heartbeat-rotation.test.sh"
+
+echo
 echo "=== unit (node) tests ==="
 node --test --test-concurrency=1 \
   "$DIR/active-team-inbox.test.mjs" \

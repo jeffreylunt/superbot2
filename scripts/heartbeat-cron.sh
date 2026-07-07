@@ -39,7 +39,11 @@ export PATH="$HOME/.local/bin:$HOME/.asdf/shims:$HOME/.asdf/bin:$PATH"
 # periodic actionable nudge never arrived). Mirror scheduler.sh / dashboard/active-team-inbox.mjs:
 # among teams with a REAL config.json, pick the one whose activity is freshest. An explicit
 # SUPERBOT2_NAME other than the legacy 'superbot2' default forces that team.
-HB_TEAM_DIR=$(node -e "
+# Wrapped in a function so it can be re-run AT WRITE TIME (see the lossless write below):
+# the team resolved here at script start can be DELETED by a session rotation before we
+# write ~minutes later, so we re-resolve just before the write instead of trusting this.
+resolve_hb_team_dir() {
+  node -e "
 const fs = require('fs'), path = require('path');
 const teamsDir = process.argv[1], pinned = process.argv[2];
 function realMtime(p) { try { const st = fs.lstatSync(p); if (st.isSymbolicLink() || !st.isFile()) return null; return st.mtimeMs; } catch { return null; } }
@@ -57,12 +61,29 @@ for (const t of teams) {
   if (!best || score > best.score) best = { dir, score };
 }
 if (best) process.stdout.write(best.dir);
-" "$CLAUDE_DIR/teams" "$SUPERBOT2_NAME" 2>/dev/null) || HB_TEAM_DIR=""
+" "$CLAUDE_DIR/teams" "$SUPERBOT2_NAME" 2>/dev/null
+}
 
-# `|| HB_TEAM_DIR=""` above: if node is missing/crashes, neutralize `set -e` for this
-# assignment so we reach the graceful fallback below instead of aborting the heartbeat.
-if [[ -n "$HB_TEAM_DIR" && -f "$HB_TEAM_DIR/config.json" ]]; then
-  INBOX="$HB_TEAM_DIR/inboxes/team-lead.json"
+# hb_resolve_inbox -> prints the team-lead inbox path of the CURRENTLY-live team (one with a
+# real config.json), rc 0; rc 1 if no live team resolves. Used both here (for dedup) and,
+# critically, again at write time so a rotation mid-run never lands a write on a dead/zombie
+# dir. Unlike the scheduler we do NOT recreate a vanished team dir: dropping a heartbeat is
+# acceptable (a fresh one regenerates within ~30 min), writing to a dead/zombie dir is not.
+hb_resolve_inbox() {
+  local team_dir
+  team_dir=$(resolve_hb_team_dir) || team_dir=""
+  if [[ -n "$team_dir" && -f "$team_dir/config.json" ]]; then
+    printf '%s' "$team_dir/inboxes/team-lead.json"
+    return 0
+  fi
+  return 1
+}
+
+# INBOX here is provisional — used only for the dedup check below; the actual write
+# re-resolves the live team. The `if` guards `set -e` (a missing/crashing node just falls
+# through to the legacy path instead of aborting the heartbeat).
+if INBOX=$(hb_resolve_inbox); then
+  :
 else
   # Fall back to the legacy fixed-team path (no worse than the prior behavior)
   INBOX="$CLAUDE_DIR/teams/$SUPERBOT2_NAME/inboxes/team-lead.json"
@@ -296,7 +317,10 @@ if [[ -f "$INBOX" ]]; then
     fi
   fi
 else
-  echo '[]' > "$INBOX"
+  # Pre-seed an empty array so the dedup read above has valid JSON on the next run. Guarded:
+  # if a rotation already deleted this (provisional) team dir, don't let the redirect abort
+  # the run under `set -e` — the write below re-resolves the live team anyway.
+  mkdir -p "$(dirname "$INBOX")" 2>/dev/null && echo '[]' > "$INBOX" 2>/dev/null || true
 fi
 
 # --- Gather counts (split by acknowledgment status) ---
@@ -631,14 +655,26 @@ message=$(jq -n \
     read: false
   }')
 
-# Append message to inbox array (using locked_write for safe concurrent access)
-locked_write "$INBOX" '. += [$msg]' --argjson msg "$message"
+# Re-resolve the live team AT WRITE TIME. Minutes may have passed since the top-of-script
+# resolution, and a session rotation can delete that team dir in between — writing to it then
+# errored ("No such file or directory") and could seed a zombie dir. Re-resolving routes to
+# whatever team is live now; if none is, we skip WITHOUT persisting the fingerprint so the
+# next run re-detects this same state and delivers it (lossless without a dead-letter queue).
+if WRITE_INBOX=$(hb_resolve_inbox); then
+  mkdir -p "$(dirname "$WRITE_INBOX")" 2>/dev/null || true
+  # Append message to inbox array (using locked_write for safe concurrent access)
+  locked_write "$WRITE_INBOX" '. += [$msg]' --argjson msg "$message"
+  echo "heartbeat: message written to $WRITE_INBOX"
+  echo "heartbeat: actions: $summary"
 
-echo "heartbeat: message written to $INBOX"
-echo "heartbeat: actions: $summary"
-
-# --- Save new fingerprint and knowledge hashes ---
-echo "$current_fingerprint" > "$FINGERPRINT_FILE"
-echo -n "$new_k_hashes" > "$KNOWLEDGE_HASH_FILE"
-echo "heartbeat: fingerprint saved"
-log_activity true
+  # --- Save new fingerprint and knowledge hashes ---
+  echo "$current_fingerprint" > "$FINGERPRINT_FILE"
+  echo -n "$new_k_hashes" > "$KNOWLEDGE_HASH_FILE"
+  echo "heartbeat: fingerprint saved"
+  log_activity true
+else
+  # No live team at write time (mid-rotation gap). Skip without saving the fingerprint so the
+  # next run redelivers. Never recreate the dead/zombie dir.
+  echo "heartbeat: no live team at write time — skipping (state will redeliver next run)"
+  log_activity true
+fi

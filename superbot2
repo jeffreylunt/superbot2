@@ -53,48 +53,16 @@ start_dashboard_ui() {
   done
 
   # Reap ORPHANED dashboard trees that the port-kill above misses. When a prior launcher was
-  # SIGKILL'd (its EXIT trap never ran), its `concurrently`/`npm run dev`/`node --watch
-  # server.js` children get reparented to init (PPID 1) and survive — but they may no longer
-  # be the port LISTENER (e.g. the listener child died), so the lsof sweep leaves a duplicate,
-  # non-listening dashboard running.
-  #
-  # SAFETY: we must reap ONLY orphans from THIS repo's dashboard — never a co-resident
-  # dashboard from a different checkout, a ~/.otherbot install, or a user's own `npm run dev`
-  # dev session (which can be live and listening on different ports). Two guards on every
-  # candidate: (1) it must be ORPHANED (PPID 1) — a live launcher's children are off-limits;
-  # (2) its working directory must be under THIS REPO_DIR. The `node --watch ../dashboard/
-  # server.js` child runs with cwd=$REPO_DIR/dashboard-ui and a RELATIVE path in its argv, so
-  # cwd is the only reliable repo-scoping signal — a bare command-substring match is not.
-  proc_cwd() {
-    # Absolute cwd of $1, or empty. lsof is the portable way to read another proc's cwd on macOS.
-    lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1
-  }
-  is_orphaned_in_repo() {
-    local pid="$1"
-    [[ "$pid" == "$$" ]] && return 1
-    local ppid
-    ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
-    [[ "$ppid" == "1" ]] || return 1          # only true orphans
-    local cwd
-    cwd=$(proc_cwd "$pid")
-    # Anchor at a path separator so a sibling checkout like "$REPO_DIR-staging" or
-    # "$REPO_DIR-worktree" is NOT matched — only exact-repo cwds qualify.
-    [[ -n "$cwd" && ( "$cwd" == "$REPO_DIR" || "$cwd" == "$REPO_DIR/"* ) ]] # only THIS repo
-  }
-  # `node --watch ../dashboard/server.js` orphans (the API server child).
-  for pid in $(pgrep -f "dashboard/server.js" 2>/dev/null); do
-    is_orphaned_in_repo "$pid" || continue
-    echo "Reaping orphaned dashboard server.js (PID $pid)..."
-    pkill -TERM -P "$pid" 2>/dev/null || true
-    kill -TERM "$pid" 2>/dev/null || true
-  done
-  # Orphaned `concurrently` launchers for this repo's dashboard-ui.
-  for pid in $(pgrep -f "dashboard-ui/node_modules/.bin/concurrently" 2>/dev/null); do
-    is_orphaned_in_repo "$pid" || continue
-    echo "Reaping orphaned dashboard concurrently (PID $pid)..."
-    pkill -TERM -P "$pid" 2>/dev/null || true
-    kill -TERM "$pid" 2>/dev/null || true
-  done
+  # SIGKILL'd (its EXIT trap never ran), the tree it left is `npm run dev` (reparented to init,
+  # PPID 1) → concurrently → npm run dev:api → node --watch server.js. The npm ROOT is the only
+  # true orphan; its children keep npm as a LIVE parent, so a PPID-1 check on concurrently /
+  # server.js never matched and a full duplicate tree survived (three observed 2026-07-04).
+  # reap_orphaned_dashboards() reaps the orphaned in-repo npm root and its entire subtree, with
+  # PPID-1 + cwd-under-REPO_DIR guards so a co-resident/sibling-checkout dashboard is untouched.
+  if [[ -f "$REPO_DIR/scripts/reap-orphaned-dashboards.sh" ]]; then
+    source "$REPO_DIR/scripts/reap-orphaned-dashboards.sh"
+    reap_orphaned_dashboards "$REPO_DIR"
+  fi
   sleep 1
 
   echo "Starting dashboard → http://localhost:${ui_port}"
@@ -494,9 +462,16 @@ while true; do
   WATCHDOG_PID=$!
 
   # Build claude args
+  # --model: the orchestrator ALWAYS runs on Opus (Jeff, 2026-07-05). It must never
+  # inherit a Fable/other default from ~/.claude/settings.json — because cwd=$HOME, that
+  # project-level settings file overrides CLAUDE_CONFIG_DIR and silently pinned Fable 5,
+  # which hit its usage limit and wedged the orchestrator (couldn't take a turn; Telegram
+  # backed up). An explicit flag wins over settings and survives restarts. Workers pick
+  # their own model per task via spawn-worker.sh --model (default opus).
   CLAUDE_ARGS=(
     --system-prompt "$PROMPT"
     --session-id "$SESSION_ID"
+    --model "${SUPERBOT2_ORCH_MODEL:-opus}"
     --dangerously-skip-permissions
   )
 
