@@ -283,11 +283,13 @@ _svc_loop_write_meta() {
   meta="$(_svc_meta "$SVC_NAME")"
   mkdir -p "$SVC_RUN_DIR"
   if [[ "$type" == "keepalive" ]]; then gap=2; else gap="$type"; fi
+  # The meta file is sourced (. "$meta") by the supervisor, so scalar values are %q-quoted
+  # to survive spaces/specials in paths. The base64 fields are safe (base64 alphabet only).
   {
-    echo "TYPE=$type"
-    echo "GAP=$gap"
-    echo "LOG=$SVC_LOG"
-    echo "SVC_PATH=${SVC_PATH:-}"
+    printf 'TYPE=%q\n' "$type"
+    printf 'GAP=%q\n' "$gap"
+    printf 'LOG=%q\n' "$SVC_LOG"
+    printf 'SVC_PATH=%q\n' "${SVC_PATH:-}"
     echo "PROGRAM_B64=$(printf '%s' "$SVC_PROGRAM" | base64 | tr -d '\n')"
     echo "ENV_B64=$(printf '%s' "${SVC_ENV:-}" | base64 | tr -d '\n')"
   } > "$meta"
@@ -296,6 +298,11 @@ _svc_loop_write_meta() {
 # Start a process in its own session (new process group), portably. Linux has
 # setsid(1); macOS does not, so fall back to perl's POSIX::setsid (mirrors scheduler.sh).
 # Backgrounds the process and echoes its PID.
+# NOTE: the PID we capture ($!) is the session leader itself — this relies on setsid(1)
+# NOT double-forking (it doesn't when it's already a process-group member, i.e. a normal
+# non-interactive script, which is always the case here) and on perl's exec keeping the
+# same PID. The whole stop/status contract (group-kill `-$pid`, `kill -0 $pid`) rests on
+# that PID being the supervisor's own session-leader PID.
 _svc_setsid_bg() {
   if command -v setsid >/dev/null 2>&1; then
     setsid nohup "$@" >/dev/null 2>&1 &

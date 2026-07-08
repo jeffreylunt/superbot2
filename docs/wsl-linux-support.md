@@ -36,6 +36,23 @@ Detection: systemd is chosen when `systemctl --user show-environment` succeeds; 
 supervisor loop. The chosen mechanism is printed, e.g.
 `service-helper: scheduler -> systemd --user timer superbot2-scheduler.timer (every 60s)`.
 
+## Notes & known limitations
+
+- **Old systemd (< 240) logs to the journal, not the log file.** `StandardOutput=append:`
+  needs systemd ≥ 240; on older systemd the units are still generated but stdout/stderr go to
+  the journal, so `tail -f ~/.superbot2/logs/<name>.log` shows an empty file. Read the logs
+  with `journalctl --user -u superbot2-<name>.service -f` instead. (WSL's current distros
+  ship systemd ≥ 249, so this only bites very old images.)
+- **Timer cadence differs subtly from launchd.** launchd `StartInterval=60` is a fixed
+  60-second period; the systemd timer uses `OnUnitActiveSec=60s`, i.e. 60s measured from the
+  *last activation* of the job, so a slow run shifts the next fire slightly. Immaterial for the
+  scheduler/heartbeat (their passes are sub-second and idempotent), but worth knowing.
+- **SVC_* values are not XML/systemd-escaped** (pre-existing behavior, carried over from the
+  original installers). All values in practice are `$HOME`-rooted paths with no `&`, `<`, `"`,
+  so this is safe today; a home directory containing XML-special characters would need
+  escaping added to `_svc_darwin_write_plist` / the systemd `ExecStart` builder. The
+  supervisor-loop meta file *is* safe (scalars are `printf %q`-quoted, argv/env base64-encoded).
+
 ### Enabling systemd on WSL (recommended)
 
 systemd on WSL is off unless enabled. To get the durable systemd-timer path:
