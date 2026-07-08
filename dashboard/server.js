@@ -17,6 +17,17 @@ const SPACES_DIR = join(SUPERBOT_DIR, 'spaces')
 const ESCALATIONS_DIR = join(SUPERBOT_DIR, 'escalations')
 const SESSIONS_DIR = join(SUPERBOT_DIR, 'sessions')
 const SUPERBOT_SKILLS_DIR = join(import.meta.dirname, '..', 'skills')
+// Cross-platform service status: service-helper.sh knows whether a superbot2 background
+// service (scheduler/heartbeat/...) is running under launchd (macOS), systemd --user, or
+// the supervisor-loop fallback (Linux/WSL). Replaces direct `launchctl list` calls so the
+// dashboard reports correct status off macOS. Exit 0 = running.
+const SERVICE_HELPER = join(import.meta.dirname, '..', 'scripts', 'service-helper.sh')
+function serviceRunning(name) {
+  try {
+    execFileSync('bash', [SERVICE_HELPER, 'status', name], { stdio: 'pipe' })
+    return true
+  } catch { return false }
+}
 const KNOWLEDGE_DIR = join(SUPERBOT_DIR, 'knowledge')
 const SKILL_DATA_DIR = join(SUPERBOT_DIR, 'skill-data')
 const LEGACY_SKILL_SETTINGS_DIR = join(SUPERBOT_DIR, 'skill-settings')
@@ -1534,8 +1545,8 @@ app.get('/api/status', async (_req, res) => {
     const { execSync } = await import('node:child_process')
     let heartbeatRunning = false
     let schedulerRunning = false
-    try { execSync('launchctl list com.superbot2.heartbeat', { stdio: 'pipe' }); heartbeatRunning = true } catch {}
-    try { execSync('launchctl list com.superbot2.scheduler', { stdio: 'pipe' }); schedulerRunning = true } catch {}
+    heartbeatRunning = serviceRunning('heartbeat')
+    schedulerRunning = serviceRunning('scheduler')
     let telegramRunning = false
     try { execSync('pgrep -f telegram-watcher', { stdio: 'pipe' }); telegramRunning = true } catch {}
     res.json({ heartbeatRunning, schedulerRunning, telegramRunning })
@@ -2210,13 +2221,8 @@ app.get('/api/schedule', async (_req, res) => {
 
     const schedule = [...globalSchedule, ...spaceSchedules]
 
-    // Check if scheduler launchd agent is loaded
-    let schedulerRunning = false
-    try {
-      const { execSync } = await import('node:child_process')
-      execSync('launchctl list com.superbot2.scheduler', { stdio: 'pipe' })
-      schedulerRunning = true
-    } catch { /* not loaded */ }
+    // Check if the scheduler service is running (cross-platform)
+    const schedulerRunning = serviceRunning('scheduler')
 
     res.json({ schedule, lastRun: lastRun || {}, schedulerRunning })
   } catch (err) {

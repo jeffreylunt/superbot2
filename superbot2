@@ -412,14 +412,14 @@ rm -f "$TEAM_DIR/config.json"
 rm -f "$RESTART_FLAG"
 IS_RESTART=false
 
-# Ensure heartbeat is running
-if ! launchctl list com.superbot2.heartbeat &>/dev/null; then
+# Ensure heartbeat is running (cross-platform status via service-helper.sh)
+if ! bash "$REPO_DIR/scripts/service-helper.sh" status heartbeat &>/dev/null; then
   echo "Installing heartbeat..."
   bash "$REPO_DIR/scripts/install-heartbeat.sh"
 fi
 
 # Ensure scheduler is running
-if ! launchctl list com.superbot2.scheduler &>/dev/null; then
+if ! bash "$REPO_DIR/scripts/service-helper.sh" status scheduler &>/dev/null; then
   echo "Installing scheduler..."
   bash "$REPO_DIR/scripts/install-scheduler.sh"
 fi

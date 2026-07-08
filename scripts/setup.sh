@@ -351,8 +351,12 @@ if [[ -n "$SHELL_PROFILE" ]]; then
   # Superbot2 alias — always update to point to the current REPO_DIR
   NEW_ALIAS="alias $SUPERBOT2_NAME=\"SUPERBOT2_NAME=$SUPERBOT2_NAME SUPERBOT2_HOME=$DIR $REPO_DIR/superbot2\""
   if grep -q "alias $SUPERBOT2_NAME=" "$SHELL_PROFILE" 2>/dev/null; then
-    # Replace existing alias line
-    sed -i '' "s|alias $SUPERBOT2_NAME=.*|$NEW_ALIAS|" "$SHELL_PROFILE"
+    # Replace existing alias line (BSD sed needs the '' in-place arg; GNU sed must not have it)
+    if [[ "$(uname)" == "Darwin" ]]; then
+      sed -i '' "s|alias $SUPERBOT2_NAME=.*|$NEW_ALIAS|" "$SHELL_PROFILE"
+    else
+      sed -i "s|alias $SUPERBOT2_NAME=.*|$NEW_ALIAS|" "$SHELL_PROFILE"
+    fi
     echo "  Updated $SUPERBOT2_NAME alias in $SHELL_PROFILE → $REPO_DIR/superbot2"
   else
     echo "" >> "$SHELL_PROFILE"

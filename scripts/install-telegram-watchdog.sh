@@ -4,7 +4,7 @@
 # reachable via Telegram — and run in tmux so App Nap can't throttle it.
 #
 #   Install / reload:  bash scripts/install-telegram-watchdog.sh
-#   Uninstall:         launchctl unload "$HOME/Library/LaunchAgents/com.superbot2.telegramwatchdog.plist"
+#   Uninstall:         bash scripts/service-helper.sh uninstall telegramwatchdog
 #   Watch live:        tmux attach -t sb2-telegram
 #
 # Chain: launchd (KeepAlive) -> telegram-tmux-supervisor.sh -> tmux session
@@ -17,8 +17,6 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT="$REPO_DIR/scripts/telegram-tmux-supervisor.sh"
-PLIST_NAME="com.superbot2.telegramwatchdog"
-PLIST_PATH="$HOME/Library/LaunchAgents/$PLIST_NAME.plist"
 SUPERBOT2_HOME="${SUPERBOT2_HOME:-$HOME/.superbot2}"
 LOG_DIR="$SUPERBOT2_HOME/logs"
 
@@ -29,48 +27,19 @@ if [[ -z "$TMUX_BIN" ]]; then echo "tmux not found on PATH" >&2; exit 1; fi
 
 mkdir -p "$LOG_DIR"
 
-if launchctl list "$PLIST_NAME" &>/dev/null; then
-  echo "Unloading existing telegram-watchdog agent..."
-  launchctl unload "$PLIST_PATH" 2>/dev/null || true
-fi
+# shellcheck source=service-helper.sh
+source "$REPO_DIR/scripts/service-helper.sh"
 
-cat > "$PLIST_PATH" << EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>$PLIST_NAME</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/bin/bash</string>
-    <string>$SCRIPT</string>
-  </array>
-  <key>KeepAlive</key>
-  <true/>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>ProcessType</key>
-  <string>Interactive</string>
-  <key>StandardOutPath</key>
-  <string>$LOG_DIR/telegram-tmux-supervisor.log</string>
-  <key>StandardErrorPath</key>
-  <string>$LOG_DIR/telegram-tmux-supervisor.log</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>SUPERBOT2_HOME</key>
-    <string>$SUPERBOT2_HOME</string>
-    <key>PATH</key>
-    <string>$(dirname "$NODE_BIN"):$(dirname "$TMUX_BIN"):/usr/bin:/bin:/usr/sbin:/sbin</string>
-  </dict>
-</dict>
-</plist>
-EOF
+SVC_PROGRAM=$'/bin/bash\n'"$SCRIPT"
+SVC_LOG="$LOG_DIR/telegram-tmux-supervisor.log"
+SVC_ENV="SUPERBOT2_HOME=$SUPERBOT2_HOME"
+SVC_PATH="$(dirname "$NODE_BIN"):$(dirname "$TMUX_BIN"):/usr/bin:/bin:/usr/sbin:/sbin"
+# macOS-only hint that keeps App Nap from throttling the interactive tmux chain;
+# ignored on Linux.
+SVC_PROCESS_TYPE="Interactive"
+service_install telegramwatchdog keepalive
 
-launchctl load "$PLIST_PATH"
 echo "telegram-watchdog agent installed and loaded."
-echo "  Plist:      $PLIST_PATH"
 echo "  Supervisor: $SCRIPT"
 echo "  Logs:       $LOG_DIR/telegram-tmux-supervisor.log (+ telegram-watcher.log)"
 echo "  Watch live: tmux attach -t sb2-telegram"
-echo "  Uninstall:  launchctl unload \"$PLIST_PATH\""

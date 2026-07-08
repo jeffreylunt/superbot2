@@ -191,14 +191,14 @@ log_restart() {
 rm -f "$RESTART_FLAG"
 rm -f "$STOP_FLAG"
 
-# Ensure heartbeat is running
-if ! launchctl list com.superbot2.heartbeat &>/dev/null; then
+# Ensure heartbeat is running (cross-platform status via service-helper.sh)
+if ! bash "$SCRIPT_DIR/service-helper.sh" status heartbeat &>/dev/null; then
   echo "Installing heartbeat..."
   bash "$SCRIPT_DIR/install-heartbeat.sh"
 fi
 
 # Ensure scheduler is running
-if ! launchctl list com.superbot2.scheduler &>/dev/null; then
+if ! bash "$SCRIPT_DIR/service-helper.sh" status scheduler &>/dev/null; then
   echo "Installing scheduler..."
   bash "$SCRIPT_DIR/install-scheduler.sh"
 fi

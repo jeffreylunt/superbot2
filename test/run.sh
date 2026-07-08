@@ -25,6 +25,10 @@ echo "=== heartbeat rotation-proofing (bash) tests ==="
 bash "$DIR/heartbeat-rotation.test.sh"
 
 echo
+echo "=== service-helper cross-platform (bash) tests ==="
+bash "$DIR/service-helper.test.sh"
+
+echo
 echo "=== unit (node) tests ==="
 node --test --test-concurrency=1 \
   "$DIR/active-team-inbox.test.mjs" \

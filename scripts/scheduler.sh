@@ -271,7 +271,13 @@ echo "$RESULT" | jq -c '.[]' | while read -r JOB; do
       # still said "Executing"). macOS ships no setsid(1); perl's POSIX::setsid is
       # the portable equivalent. The sleep keeps this script alive past the child's
       # setsid() call so the group-kill can never land in the fork→setsid window.
-      /usr/bin/perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' /bin/bash "$RESOLVED_SCRIPT" </dev/null >> "$LOG" 2>&1 &
+      # Linux ships setsid(1) (and systemd/loop don't group-kill us anyway); macOS
+      # lacks setsid so use perl's POSIX::setsid, which is always present there.
+      if command -v setsid >/dev/null 2>&1; then
+        setsid /bin/bash "$RESOLVED_SCRIPT" </dev/null >> "$LOG" 2>&1 &
+      else
+        /usr/bin/perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' /bin/bash "$RESOLVED_SCRIPT" </dev/null >> "$LOG" 2>&1 &
+      fi
       sleep 1
     fi
   fi

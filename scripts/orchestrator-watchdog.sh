@@ -18,10 +18,12 @@
 #      relaunches WITH --resume, preserving the session). If the launcher itself is dead,
 #      SIGTERM the orphan claude so the crash path relaunches fresh next cycle.
 #   3. COMPANIONS: restart telegram-watchdog if dead (while telegram enabled); reinstall
-#      the com.superbot2.{scheduler,heartbeat,wakenudge} launchd agents if unloaded.
+#      the scheduler/heartbeat/wakenudge services if not running (status is cross-platform
+#      via scripts/service-helper.sh).
 #
-# Runs under launchd (com.superbot2.orchestratorwatchdog, KeepAlive) — see
-# scripts/install-orchestrator-watchdog.sh. Uninstall = `launchctl unload` that plist.
+# Runs as a keepalive service (launchd on macOS, systemd --user / supervisor-loop on
+# Linux/WSL) — see scripts/install-orchestrator-watchdog.sh.
+# Uninstall = `bash scripts/service-helper.sh uninstall orchestratorwatchdog`.
 # Env overrides (also used by test/orchestrator-watchdog.test.sh):
 #   OW_CHECK_INTERVAL, OW_STARTUP_GRACE_S, OW_WEDGE_THRESHOLD_S, OW_WEDGE_COOLDOWN_S,
 #   OW_RELAUNCH_CAP, OW_CAP_WINDOW_S, OW_ALIVE_CMD, OW_ALIVE_RETRIES, OW_DOWN_CONFIRM,
@@ -283,11 +285,11 @@ ensure_companions() {
       (unset SUPERBOT2_NAME; nohup bash "$SCRIPT_DIR/telegram-watchdog.sh" >/dev/null 2>&1 &)
     fi
   fi
-  # launchd agents (idempotent installers)
+  # background services (idempotent installers); status is cross-platform via service-helper.sh
   local agent
   for agent in scheduler heartbeat wakenudge; do
-    if ! launchctl list "com.superbot2.$agent" >/dev/null 2>&1; then
-      log "launchd agent com.superbot2.$agent not loaded — reinstalling"
+    if ! bash "$SCRIPT_DIR/service-helper.sh" status "$agent" >/dev/null 2>&1; then
+      log "service $agent not running — reinstalling"
       case "$agent" in
         scheduler) bash "$SCRIPT_DIR/install-scheduler.sh" >>"$LOG_FILE" 2>&1 || true ;;
         heartbeat) bash "$SCRIPT_DIR/install-heartbeat.sh" >>"$LOG_FILE" 2>&1 || true ;;
