@@ -18,8 +18,32 @@ if [ -f "$PID_FILE" ]; then
 fi
 echo $$ > "$PID_FILE.$$"
 mv "$PID_FILE.$$" "$PID_FILE"
-_cleanup() { rm -f "$PID_FILE" "${SCHEDULE:-}"; }
+
+# Max-runtime self-guard. The singleton guard above means ONE wedged tick darks the
+# WHOLE scheduler: every later 60s launchd fire sees the stale PID still alive and
+# exits, so a single hung synchronous op (a wedged node/jq/fs call, or any future
+# network call added without a timeout) silently suppresses ALL scheduled jobs until
+# it finally dies — the multi-hour-blackout signature (7/2). Bound every tick to < the
+# 60s StartInterval so a wedge self-terminates and the very next fire recovers.
+# Dispatched script jobs run in their OWN session (perl setsid, below) — not in this
+# process, so the guard never cuts short a legitimately long-running job.
+MAIN_PID=$$
+WATCHDOG_PID=""
+_cleanup() { [[ -n "$WATCHDOG_PID" ]] && kill "$WATCHDOG_PID" 2>/dev/null; rm -f "$PID_FILE" "${SCHEDULE:-}"; }
 trap _cleanup EXIT
+mkdir -p "$DIR/logs"
+SELF_GUARD_SECS="${SCHEDULER_MAX_TICK_SECS:-55}"
+(
+  sleep "$SELF_GUARD_SECS"
+  echo "$(date '+%Y-%m-%d %H:%M') - SELF-GUARD: tick (PID $MAIN_PID) exceeded ${SELF_GUARD_SECS}s — killing wedged tick so the next fire recovers" >> "$DIR/logs/scheduler.log"
+  kill -TERM "$MAIN_PID" 2>/dev/null
+  sleep 3
+  kill -KILL "$MAIN_PID" 2>/dev/null
+) &
+WATCHDOG_PID=$!
+# Disown so _cleanup's kill of the still-sleeping watchdog on a NORMAL tick doesn't emit
+# a bash job-control "Terminated" line to the log every 60s (kill-by-PID still reaps it).
+disown "$WATCHDOG_PID" 2>/dev/null || true
 
 # Source file locking helper
 source "$SCRIPT_DIR/lock-helper.sh"
@@ -129,35 +153,70 @@ for (const job of schedule) {
   }
 }
 
+const nowMinutes = parseInt(nowHour, 10) * 60 + parseInt(nowMin, 10);
+
+// All non-time guards (day-of-week / one-shot date / day-of-month / month) are
+// evaluated against TODAY. Catch-up is scoped to the current calendar day, so a
+// missed occurrence and the current tick share the same date — the same guards apply.
+//
+// KNOWN BOUND — midnight crossing: catch-up only back-fills TODAY's slots. A slot
+// missed on the far side of midnight (e.g. a 23:50 job while the scheduler was down
+// overnight, recovering at 00:10) is NOT back-filled: its last-run key is keyed to
+// yesterday's date, which no later tick revisits. This is deliberate — it bounds
+// catch-up and avoids re-evaluating yesterday's day-of-week/date guards. The real
+// incident class (a multi-hour DAYTIME blackout, e.g. 7/2 08:00–16:30) is fully
+// covered; overnight cross-midnight misses are the accepted residual gap.
+function guardsPass(job) {
+  if (job.days && job.days.length > 0 && !job.days.includes(nowDay)) return false;
+  if (job.date && job.date !== nowDate) return false; // one-shot fires only on its date
+  if (job.dayOfMonth != null) {
+    const dom = Array.isArray(job.dayOfMonth) ? job.dayOfMonth : [job.dayOfMonth];
+    if (!dom.map(Number).includes(nowDom)) return false;
+  }
+  if (job.months != null) {
+    const mm = Array.isArray(job.months) ? job.months : [job.months];
+    if (!mm.map(Number).includes(nowMonth)) return false;
+  }
+  return true;
+}
+
 const due = [];
 for (const job of schedule) {
+  if (!guardsPass(job)) continue;
   // Support both time (string) and times (string[])
   const jobTimes = job.times || (job.time ? [job.time] : []);
+
+  // Collect every scheduled occurrence for TODAY that is due-now-or-overdue and not
+  // yet fired. This is the catch-up sweep: if the scheduler was dark when a slot's
+  // exact minute passed, that slot is still <= now and unmarked, so we pick it up here
+  // instead of losing it (the old code only matched jobH===now && jobM===now).
+  let latest = null;          // most-recent overdue slot — the one we actually dispatch
+  const missedKeys = [];      // every overdue-unfired slot — all marked, to coalesce
   for (const t of jobTimes) {
     const [jobH, jobM] = t.split(':');
-    if (jobH !== nowHour || jobM !== nowMin) continue;
-    if (job.days && job.days.length > 0 && !job.days.includes(nowDay)) continue;
-    // One-shot date guard: if 'date' is set, only fire on that exact YYYY-MM-DD
-    if (job.date && job.date !== nowDate) continue;
-    // Day-of-month guard: integer (1..31) or array of ints
-    if (job.dayOfMonth != null) {
-      const dom = Array.isArray(job.dayOfMonth) ? job.dayOfMonth : [job.dayOfMonth];
-      if (!dom.map(Number).includes(nowDom)) continue;
-    }
-    // Months-of-year guard: integer (1..12) or array of ints (e.g. [2,5,8,11] for quarterly)
-    if (job.months != null) {
-      const mm = Array.isArray(job.months) ? job.months : [job.months];
-      if (!mm.map(Number).includes(nowMonth)) continue;
-    }
+    const slotMinutes = parseInt(jobH, 10) * 60 + parseInt(jobM, 10);
+    if (Number.isNaN(slotMinutes)) continue;
+    if (slotMinutes > nowMinutes) continue;          // still in the future today — leave it
     const key = job.name + ':' + nowDate + 'T' + t;
-    if (lastRun[key] === key) continue;
-    lastRun[key] = key;
-    // Include the matched time in the output for the inbox message
-    due.push({ ...job, time: t });
-    break; // only fire once per job per minute
+    if (lastRun[key] === key) continue;              // already fired — dedup
+    missedKeys.push(key);
+    if (!latest || slotMinutes > latest.minutes) latest = { t, minutes: slotMinutes };
   }
+  if (!latest) continue;
+
+  // Coalesce: mark ALL overdue slots fired (so a job that missed many fires — e.g. a
+  // 30-min sweep down 8h — never re-fires the backlog 16x), but dispatch only the
+  // single most-recent slot. A slot firing later than its scheduled minute is a catch-up.
+  for (const key of missedKeys) lastRun[key] = key;
+  due.push({ ...job, time: latest.t, _catchUp: latest.minutes < nowMinutes });
 }
-fs.writeFileSync(process.argv[2], JSON.stringify(lastRun, null, 2));
+// Persist last-run BEFORE the due array is emitted (bash dispatches only after node
+// returns), so every slot is durably marked before its first dispatch — a crash or a
+// self-guard kill mid-dispatch can never double-fire a caught-up slot. Write atomically
+// (tmp + rename) so a kill landing mid-write can't leave a truncated/corrupt tracker.
+const lrPath = process.argv[2];
+fs.writeFileSync(lrPath + '.tmp', JSON.stringify(lastRun, null, 2));
+fs.renameSync(lrPath + '.tmp', lrPath);
 if (due.length > 0) console.log(JSON.stringify(due));
 " "$SCHEDULE" "$LAST_RUN" "$NOW_HOUR" "$NOW_MIN" "$NOW_DAY" "$NOW_DATE" "$NOW_DOM" "$NOW_MONTH" 2>> "$LOG")
 
@@ -219,6 +278,10 @@ echo "$RESULT" | jq -c '.[]' | while read -r JOB; do
   JOB_SPACE=$(echo "$JOB" | jq -r '.space // empty')
   JOB_DAYS=$(echo "$JOB" | jq -c '.days // []')
 
+  # Slots fired later than their scheduled minute (scheduler was dark) are caught up.
+  CATCHUP_TAG=""
+  [[ "$(echo "$JOB" | jq -r '._catchUp // false')" == "true" ]] && CATCHUP_TAG=" (catch-up)"
+
   # Only post an inbox note if the job has a real task. Script-only jobs
   # (script field set, task empty/absent) run silently — they self-report via
   # their own logs, so they must not spam team-lead 48x/day.
@@ -236,7 +299,7 @@ echo "$RESULT" | jq -c '.[]' | while read -r JOB; do
       '{from: $from, type: $type, text: $text, summary: $summary, metadata: {jobName: $jobName, scheduledTime: $jobTime, space: (if $jobSpace != "" then $jobSpace else null end), days: $jobDays}, timestamp: $ts, read: false}')
 
     if TARGET_INBOX=$(deliver_to_inbox "$MSG"); then
-      echo "$(date '+%Y-%m-%d %H:%M') - Scheduled: $JOB_NAME → $TARGET_INBOX" >> "$LOG"
+      echo "$(date '+%Y-%m-%d %H:%M') - Scheduled: $JOB_NAME$CATCHUP_TAG → $TARGET_INBOX" >> "$LOG"
     else
       echo "$MSG" | jq -c '.' >> "$DEAD_LETTER" 2>/dev/null || echo "$MSG" >> "$DEAD_LETTER"
       echo "$(date '+%Y-%m-%d %H:%M') - DELIVERY FAILED for $JOB_NAME — dead-lettered to $DEAD_LETTER (will retry next run)" >> "$LOG"
@@ -262,7 +325,7 @@ echo "$RESULT" | jq -c '.[]' | while read -r JOB; do
     elif [[ ! -f "$RESOLVED_SCRIPT" ]]; then
       echo "$(date '+%Y-%m-%d %H:%M') - REJECTED script for $JOB_NAME: file not found ($RESOLVED_SCRIPT)" >> "$LOG"
     else
-      echo "$(date '+%Y-%m-%d %H:%M') - Executing script for $JOB_NAME: $RESOLVED_SCRIPT" >> "$LOG"
+      echo "$(date '+%Y-%m-%d %H:%M') - Executing script for $JOB_NAME$CATCHUP_TAG: $RESOLVED_SCRIPT" >> "$LOG"
       # Spawn in a NEW SESSION, not a plain background subshell. Under launchd a
       # backgrounded child shares this script's process group, and launchd SIGKILLs
       # that whole group the moment this script exits (AbandonProcessGroup defaults
