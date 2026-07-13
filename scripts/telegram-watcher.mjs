@@ -1494,6 +1494,18 @@ async function checkForReplies() {
   if (replyCheckRunning) return
   replyCheckRunning = true
 
+  // outboundStuck: true when this cycle ends with a reply we FAILED to deliver.
+  // The outbound heartbeat must reflect "outbound is HEALTHY", not merely "the loop
+  // cycled" — otherwise a watcher that keeps looping but can't send (network wedge:
+  // fetch timeouts every cycle) refreshes the heartbeat forever and the watchdog's
+  // outbound-staleness check never fires. That is exactly the silent ~30-min outage on
+  // 2026-07-13 (the orchestrator had to manually restart the watcher). When stuck, we
+  // SKIP the heartbeat write so it goes stale and the watchdog restarts a fresh watcher
+  // (which retries from the same counter — nothing is dropped). A one-off transient
+  // failure just skips one write; only a stall persisting past the watchdog threshold
+  // (~180s) triggers a restart.
+  let outboundStuck = false
+
   if (!chatId) {
     // Loop is alive even without a chatId — record liveness and bail.
     replyCheckRunning = false
@@ -1719,6 +1731,7 @@ async function checkForReplies() {
        // Transient delivery failure (network / Telegram down). Stop the batch and
        // retry from this exact reply next cycle — never advance past an undelivered
        // message, so a restart/handoff can't silently drop it.
+       outboundStuck = true // don't refresh the outbound heartbeat: let the watchdog see the stall
        logError(`Outbound delivery failed for reply idx ${replyIdx} — will retry next cycle (no drop)`)
        break
      }
@@ -1735,10 +1748,12 @@ async function checkForReplies() {
   } catch (err) {
     logError(`Error checking for replies: ${err.message}`)
   } finally {
-    // Always record outbound liveness, even on error — completing a cycle (success
-    // or handled error) proves the loop is alive. Only an indefinite hang would
-    // skip this, which is exactly what the watchdog's outbound-staleness check catches.
-    await writeOutboundHeartbeat()
+    // Record outbound liveness — UNLESS a reply is stuck undelivered this cycle. A
+    // completed cycle proves the loop isn't hung, but if we couldn't SEND, outbound is
+    // not healthy; skipping the write lets the heartbeat go stale so the watchdog
+    // restarts a fresh watcher (see outboundStuck above). Both a true hang (no cycle
+    // completes) and a persistent send-stall now surface as a stale outbound heartbeat.
+    if (!outboundStuck) await writeOutboundHeartbeat()
     replyCheckRunning = false
   }
 }
