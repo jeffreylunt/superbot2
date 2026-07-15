@@ -153,12 +153,16 @@ relaunch_orchestrator() {
   # trusts (a launchd-spawned tmux window otherwise inherits cwd=/ and claude BLOCKS on an
   # interactive "trust this folder?" prompt — observed live 2026-07-03 16:02Z) and it's the
   # cwd that maps to the -Users-jeff transcript dir the wake-nudge/health checks follow.
-  if ! tmux list-sessions >/dev/null 2>&1; then
-    log "no tmux server — creating detached session 'superbot2' running the launcher"
-    tmux new-session -d -s superbot2 -c "$HOME" "exec bash '$LAUNCHER'"
+  # Always relaunch into a DEDICATED session (default 'superbot2', override with
+  # OW_TMUX_SESSION) — never "the first session that happens to exist". When the
+  # orchestrator's original session died, head -1 picked sb2-telegram (the telegram
+  # chain's session, observed live 2026-07-15), entangling the two supervision chains:
+  # the telegram tmux supervisor treats that session as ITS OWN to kill/recreate.
+  local sess="${OW_TMUX_SESSION:-superbot2}"
+  if ! tmux has-session -t "=$sess" 2>/dev/null; then
+    log "creating detached tmux session '$sess' running the launcher"
+    tmux new-session -d -s "$sess" -c "$HOME" "exec bash '$LAUNCHER'"
   else
-    local sess
-    sess=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | head -1)
     log "relaunching launcher in a new window of tmux session '$sess'"
     # Trailing colon: target the SESSION (next free window index). A bare "-t $sess" is
     # parsed as window index when the session is numeric ("create window failed: index 0
