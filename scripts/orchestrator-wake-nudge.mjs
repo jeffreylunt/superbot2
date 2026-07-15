@@ -211,8 +211,12 @@ async function capturePane() {
 // an actual message. The empty-prompt gate guarantees we never clobber user-typed text, and
 // the cooldown caps this at one short sentinel turn per stall window.
 // Newlines are stripped (review M1): a \n inside `-l` text would submit multiple turns.
+// Keep it SHORT: a long sentinel WRAPS across pane lines, and the post-type verify then
+// reads only the first wrapped segment (a prefix), fails the match, and aborts before Enter
+// — leaving stuck text that blocks every future nudge (live 2026-07-15). ~40 chars stays on
+// one line in any realistic pane width; sendNudge's verify also tolerates wrapping as backup.
 const WAKE_TEXT = (process.env.WAKE_NUDGE_TEXT ||
-  '[wake-nudge] Your team inbox has a stalled backlog — process pending messages now.')
+  '[wake-nudge] process your pending inbox')
   .replace(/[\r\n]+/g, ' ').trim()
 
 function sleepMs(ms) { return new Promise((r) => setTimeout(r, ms)) }
@@ -235,17 +239,20 @@ async function sendNudge() {
   // be misread as send-keys flags (review M1). -l types it literally (no key-name lookup).
   await pexecFile('tmux', ['send-keys', '-t', pane, '-l', '--', WAKE_TEXT])
 
-  // Post-type verify (review I1 belt-and-suspenders): only press Enter if the prompt now
-  // contains EXACTLY the sentinel. Concurrent keystrokes / rendering surprises => leave the
-  // text unsubmitted (visible + editable — strictly safer than submitting a merged line) and
-  // log loudly. Retry briefly first: the UI may lag a beat before echoing the typed text.
+  // Post-type verify (review I1 belt-and-suspenders): only press Enter once the prompt shows
+  // our sentinel. Accept an exact match OR a non-empty PREFIX of it: a long prompt wraps in
+  // the pane and extractPromptText then returns only the first wrapped segment (a prefix) —
+  // which aborted real nudges and left stuck text on 2026-07-15. A prefix is safe here because
+  // the pre-type race guard already proved the prompt was empty, so a prefix of our own text
+  // can only be our wrapped sentinel, never stray user input. Retry briefly: the UI may lag.
+  const looksLikeSentinel = (t) => typeof t === 'string' && t.length > 0 && WAKE_TEXT.startsWith(t)
   let typed = null
   for (let i = 0; i < 6; i++) {
     await sleepMs(150)
     typed = extractPromptText((await capturePaneById(pane)) ?? '')
-    if (typed === WAKE_TEXT) break
+    if (looksLikeSentinel(typed)) break
   }
-  if (typed !== WAKE_TEXT) {
+  if (!looksLikeSentinel(typed)) {
     log(`sendNudge ABORTED before Enter: prompt reads ${JSON.stringify((typed || '').slice(0, 100))}, expected the sentinel — left unsubmitted, check pane ${pane}`)
     return
   }
