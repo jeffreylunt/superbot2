@@ -109,8 +109,17 @@ async function readTranscriptMtimeMs() {
 // Find the tmux pane whose process subtree runs `<repo>/superbot2`. We resolve the launcher PID,
 // then match it to a pane by walking the pane_pid -> ... ancestry. Cached after first success.
 let cachedPane = null
+let cachedPaneAtMs = 0
+// Existence re-verification alone is NOT enough: after the orchestrator crash-relaunches
+// into a different window/session, a pane can still EXIST while no longer being the
+// orchestrator's (observed live 2026-07-15: the daemon read a wrong pane as UNKNOWN_PROMPT
+// for hours — blocked all nudges + false-fired the unreadable-prompt alert — until a
+// process restart cleared in-memory state). A short TTL forces full rediscovery so ANY
+// stale-cache condition self-heals within a minute instead of persisting until restart.
+const PANE_CACHE_TTL_MS = Number(process.env.WAKE_NUDGE_PANE_CACHE_TTL_MS) || 60_000
 async function discoverPane() {
   if (FORCED_PANE) return FORCED_PANE
+  if (cachedPane && Date.now() - cachedPaneAtMs > PANE_CACHE_TTL_MS) cachedPane = null
   if (cachedPane) {
     // Re-verify the cached pane still exists.
     try {
@@ -178,6 +187,7 @@ async function discoverPane() {
     return null
   }
   cachedPane = [...matchedPanes][0]
+  cachedPaneAtMs = Date.now()
   return cachedPane
 }
 
