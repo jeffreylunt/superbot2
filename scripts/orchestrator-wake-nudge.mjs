@@ -336,6 +336,11 @@ async function healthSnapshot() {
     transcriptBeforeBacklog: backlogMs != null && transcriptMs != null && transcriptMs < backlogMs,
     promptEmpty: cap != null && promptIsEmpty(cap),
     bootDialog: plainCap != null && BOOT_DIALOG_RE.test(plainCap) && /Enter to confirm/.test(plainCap),
+    // The session feedback/rating modal ("1: Bad  2: Fine  3: Good  0: Dismiss") blocks
+    // the session like a boot dialog but wants '0' (Dismiss), NOT Enter (which would
+    // submit a rating). Observed live 2026-07-17 02:28Z: it modally blocked the
+    // orchestrator ~25 min — messages queued unread until the canary alert fired.
+    feedbackDialog: plainCap != null && /0: Dismiss/.test(plainCap) && /1: Bad/.test(plainCap),
   }
 }
 
