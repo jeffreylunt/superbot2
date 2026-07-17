@@ -223,11 +223,22 @@ kill_orphan_claude() {
 # relaunch the same $HOME workspace + repo config Jeff already trusts, and we only press
 # Enter when the health probe positively identifies a known boot dialog.
 accept_boot_dialog() {
-  local json dialog pane
+  local json dialog feedback pane
   json="$1"
   dialog=$(echo "$json" | jq -r '.bootDialog' 2>/dev/null)
+  feedback=$(echo "$json" | jq -r '.feedbackDialog' 2>/dev/null)
   pane=$(echo "$json" | jq -r '.paneId // empty' 2>/dev/null)
-  [ "$dialog" = "true" ] && [ -n "$pane" ] || return 1
+  [ -n "$pane" ] || return 1
+  # Feedback/rating modal ("1: Bad ... 0: Dismiss") — press '0' to DISMISS. Enter would
+  # submit a rating. Blocked the orchestrator ~25 min live 2026-07-17 until dismissed.
+  if [ "$feedback" = "true" ]; then
+    log "feedback/rating modal detected in pane $pane — dismissing (0)"
+    if [ -n "${OW_ACCEPT_CMD:-}" ]; then bash -c "$OW_ACCEPT_CMD" >/dev/null 2>&1; else
+      tmux send-keys -t "$pane" 0 2>/dev/null || true
+    fi
+    return 0
+  fi
+  [ "$dialog" = "true" ] || return 1
   log "boot dialog detected in pane $pane — auto-confirming (Enter)"
   if [ -n "${OW_ACCEPT_CMD:-}" ]; then bash -c "$OW_ACCEPT_CMD" >/dev/null 2>&1; else
     tmux send-keys -t "$pane" Enter 2>/dev/null || true
