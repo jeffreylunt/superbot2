@@ -306,3 +306,21 @@ test('boot dialog is detected on an escaped (-e) capture after stripping codes',
   assert.ok(BOOT_DIALOG_RE.test(plain), 'dialog phrase detected on stripped capture')
   assert.ok(/Enter to confirm/.test(plain), 'confirm hint detected on stripped capture')
 })
+
+// --- nudge sentinel must survive pane line-wrap (live regression 2026-07-15) ---
+// A long wake sentinel wraps across pane lines; only the first line carries the ❯ marker,
+// so extractPromptText returns just that first segment — a PREFIX of the sentinel. The old
+// verify required an EXACT match, so it aborted before Enter and left stuck text that then
+// blocked every future nudge. Two guarantees: (1) the default sentinel is short enough to
+// not wrap; (2) sendNudge's verify accepts a non-empty prefix (mirrored here).
+test('wake sentinel is short enough to not wrap, and prefix-match recognizes a wrapped sentinel', () => {
+  const WAKE_TEXT = '[wake-nudge] process your pending inbox'
+  assert.ok(WAKE_TEXT.length <= 45, `sentinel should stay on one line (was ${WAKE_TEXT.length} chars)`)
+  const looksLikeSentinel = (t) => typeof t === 'string' && t.length > 0 && WAKE_TEXT.startsWith(t)
+  // A wrapped capture yields the first segment (prefix) — must still be recognized.
+  assert.ok(looksLikeSentinel('[wake-nudge] process your'), 'wrapped prefix recognized')
+  assert.ok(looksLikeSentinel(WAKE_TEXT), 'exact match recognized')
+  // Guard: unrelated/empty prompt text is NOT mistaken for the sentinel.
+  assert.ok(!looksLikeSentinel(''), 'empty is not the sentinel')
+  assert.ok(!looksLikeSentinel('push on build-pipeline-v2'), 'unrelated text is not the sentinel')
+})

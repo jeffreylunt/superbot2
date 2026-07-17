@@ -51,6 +51,20 @@ const POLL_TIMEOUT = 30
 const TYPING_INTERVAL = 3000
 const REPLY_POLL_INTERVAL = Number(process.env.TG_REPLY_POLL_INTERVAL) || 3000
 const ESCALATION_POLL_INTERVAL = 10000
+// --- end-to-end canary ---------------------------------------------------------
+// Two weeks of incidents (2026-07-03..16) shared one meta-problem: each new failure mode
+// (routing orphaned, nudge blocked, model wedged, dialog stall, send-stall...) was only
+// discovered when Jeff messaged and got silence. The canary closes that: every
+// CANARY_INTERVAL_MS the watcher injects a synthetic message through the SAME inbound
+// path as a real Telegram message (dashboard POST → team inbox → orchestrator wake/nudge
+// → SendMessage → watcher relay) and expects a '[canary-ack ...]' reply, which it
+// SWALLOWS (never forwarded to Jeff). No ack within CANARY_TIMEOUT_MS ⇒ ONE direct
+// Telegram alert to Jeff naming the broken leg, latched until the next successful ack
+// ('recovered' note). Disable with telegram.canary=false in config.json.
+const CANARY_INTERVAL_MS = Number(process.env.TG_CANARY_INTERVAL_MS) || 30 * 60 * 1000
+const CANARY_TIMEOUT_MS = Number(process.env.TG_CANARY_TIMEOUT_MS) || 10 * 60 * 1000
+const CANARY_INITIAL_DELAY_MS = Number(process.env.TG_CANARY_INITIAL_DELAY_MS) || 3 * 60 * 1000
+const CANARY_TICK_MS = Number(process.env.TG_CANARY_TICK_MS) || 60 * 1000
 // Active-inbox switch hysteresis: when two team inboxes briefly look "active" (e.g. a
 // restart/handoff overlap), a naive most-recent-mtime pick can FLIP between them, and each
 // flip resets the counter to 0 and re-forwards the whole inbox → duplicate Telegram blasts.
@@ -189,6 +203,23 @@ async function fileMtimeMs(filePath) {
 // oscillation vector). team-lead.json mtime only breaks exact dashMtime ties (rare), to
 // keep the choice deterministic. Returns { inboxesDir, dashMtime } or null if none found.
 async function findCandidateInbox() {
+  // Ground truth first: the RUNNING orchestrator's own team (argv --session-id →
+  // session-<uuid8> dir). Freshness scoring below mis-resolves after every restart —
+  // the new session has no team dir yet, so "freshest" is the PREVIOUS session's and
+  // inbound messages orphan there (live 4x, 2026-07-13..16). Dynamic import so the
+  // watcher still runs even if the dashboard module is missing (partial deploy).
+  try {
+    const { liveOrchestratorTeamDir } = await import('../dashboard/active-team-inbox.mjs')
+    const liveDir = await liveOrchestratorTeamDir(TEAMS_DIR)
+    if (liveDir) {
+      const inboxesDir = join(liveDir, 'inboxes')
+      const dashMtime = await fileMtimeMs(join(inboxesDir, 'dashboard-user.json'))
+      // dashMtime may be null on a just-created team — treat as now-ish so hysteresis
+      // (which compares candidate vs current mtimes) lets the live team win.
+      return { inboxesDir, dashMtime: dashMtime ?? Date.now() }
+    }
+  } catch { /* fall through to freshness scoring */ }
+
   let teamDirs = []
   try {
     teamDirs = await readdir(TEAMS_DIR)
@@ -1494,6 +1525,18 @@ async function checkForReplies() {
   if (replyCheckRunning) return
   replyCheckRunning = true
 
+  // outboundStuck: true when this cycle ends with a reply we FAILED to deliver.
+  // The outbound heartbeat must reflect "outbound is HEALTHY", not merely "the loop
+  // cycled" — otherwise a watcher that keeps looping but can't send (network wedge:
+  // fetch timeouts every cycle) refreshes the heartbeat forever and the watchdog's
+  // outbound-staleness check never fires. That is exactly the silent ~30-min outage on
+  // 2026-07-13 (the orchestrator had to manually restart the watcher). When stuck, we
+  // SKIP the heartbeat write so it goes stale and the watchdog restarts a fresh watcher
+  // (which retries from the same counter — nothing is dropped). A one-off transient
+  // failure just skips one write; only a stall persisting past the watchdog threshold
+  // (~180s) triggers a restart.
+  let outboundStuck = false
+
   if (!chatId) {
     // Loop is alive even without a chatId — record liveness and bail.
     replyCheckRunning = false
@@ -1550,6 +1593,8 @@ async function checkForReplies() {
       const text = reply.text || reply.content || ''
       if (!text.trim()) {
         delivered = true // nothing to send — count as handled
+      } else if (handleCanaryAck(text.trim())) {
+        delivered = true // canary plumbing — swallowed, never forwarded to Jeff
       } else {
 
       // Find the correct user message to thread this reply to.
@@ -1719,6 +1764,7 @@ async function checkForReplies() {
        // Transient delivery failure (network / Telegram down). Stop the batch and
        // retry from this exact reply next cycle — never advance past an undelivered
        // message, so a restart/handoff can't silently drop it.
+       outboundStuck = true // don't refresh the outbound heartbeat: let the watchdog see the stall
        logError(`Outbound delivery failed for reply idx ${replyIdx} — will retry next cycle (no drop)`)
        break
      }
@@ -1735,10 +1781,12 @@ async function checkForReplies() {
   } catch (err) {
     logError(`Error checking for replies: ${err.message}`)
   } finally {
-    // Always record outbound liveness, even on error — completing a cycle (success
-    // or handled error) proves the loop is alive. Only an indefinite hang would
-    // skip this, which is exactly what the watchdog's outbound-staleness check catches.
-    await writeOutboundHeartbeat()
+    // Record outbound liveness — UNLESS a reply is stuck undelivered this cycle. A
+    // completed cycle proves the loop isn't hung, but if we couldn't SEND, outbound is
+    // not healthy; skipping the write lets the heartbeat go stale so the watchdog
+    // restarts a fresh watcher (see outboundStuck above). Both a true hang (no cycle
+    // completes) and a persistent send-stall now surface as a stale outbound heartbeat.
+    if (!outboundStuck) await writeOutboundHeartbeat()
     replyCheckRunning = false
   }
 }
@@ -1975,15 +2023,101 @@ function sleep(ms) {
 
 let replyCheckTimer = null
 let escalationCheckTimer = null
+let canaryTimer = null
+
+// --- canary state (see CANARY_* constants for design) ---
+let canaryEnabled = true      // config.json telegram.canary !== false
+let canaryStartedAt = 0       // watcher boot time (for the initial delay)
+let canaryLastSentAt = 0
+let canaryPending = null      // { nonce, sentAt } while awaiting an ack
+let canaryAlerted = false     // latched after a failure alert until the next good ack
+
+function canaryText(nonce) {
+  return `[canary ${nonce}] Automated end-to-end health check — reply with exactly ` +
+    `"[canary-ack ${nonce}]" via SendMessage to dashboard-user. Do nothing else: no ` +
+    `logging, no escalation, no other action.`
+}
+
+async function canaryTick() {
+  if (!canaryEnabled || !chatId) return
+  const now = Date.now()
+
+  // 1. Pending canary overdue? Alert ONCE (latched), then retry on the next interval.
+  if (canaryPending && now - canaryPending.sentAt > CANARY_TIMEOUT_MS) {
+    logError(`CANARY FAILED: no ack for ${Math.round((now - canaryPending.sentAt) / 1000)}s (nonce=${canaryPending.nonce})`)
+    canaryPending = null
+    if (!canaryAlerted) {
+      canaryAlerted = true
+      try {
+        await sendMessage(
+          `⚠️ superbot2 end-to-end check failed: a synthetic message was injected ` +
+          `${Math.round(CANARY_TIMEOUT_MS / 60000)} min ago and the orchestrator never replied. ` +
+          `Inbound relay is working (this alert reached you via the same bot), so the break is in ` +
+          `the orchestrator wake/reply path. I'll keep checking and tell you when it recovers — ` +
+          `if you have the machine handy: tmux attach -t superbot2`,
+          { parseMode: undefined },
+        )
+      } catch (err) {
+        logError(`canary alert send failed: ${err.message}`)
+      }
+    }
+  }
+
+  // 2. Time to send a new canary? (initial delay after boot, then every interval)
+  const dueAt = canaryLastSentAt === 0 ? canaryStartedAt + CANARY_INITIAL_DELAY_MS : canaryLastSentAt + CANARY_INTERVAL_MS
+  if (canaryPending || now < dueAt) return
+  const nonce = Math.random().toString(36).slice(2, 8)
+  try {
+    const res = await fetch(`${DASHBOARD_API}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: canaryText(nonce) }),
+    })
+    if (!res.ok) throw new Error(`dashboard HTTP ${res.status}`)
+    canaryLastSentAt = now
+    canaryPending = { nonce, sentAt: now }
+    log(`canary sent (nonce=${nonce})`)
+  } catch (err) {
+    // The dashboard leg itself is broken — that IS a canary failure.
+    logError(`CANARY FAILED at injection (dashboard relay): ${err.message}`)
+    canaryLastSentAt = now
+    if (!canaryAlerted) {
+      canaryAlerted = true
+      await sendMessage(
+        `⚠️ superbot2 end-to-end check failed at the first leg: the dashboard relay refused the ` +
+        `synthetic message (${err.message}). Real Telegram messages are likely NOT reaching the ` +
+        `orchestrator right now.`,
+        { parseMode: undefined },
+      ).catch(() => {})
+    }
+  }
+}
+
+// Called from the reply loop when a '[canary-ack ...]' reply is seen. Returns true when
+// the reply is canary plumbing (swallow it — never forward to Jeff).
+function handleCanaryAck(text) {
+  if (!text.startsWith('[canary-ack')) return false
+  const ok = canaryPending && text.includes(canaryPending.nonce)
+  log(`canary ack received (${ok ? `${Math.round((Date.now() - canaryPending.sentAt) / 1000)}s` : 'late/unmatched'})`)
+  canaryPending = null
+  if (canaryAlerted) {
+    canaryAlerted = false
+    sendMessage('✅ superbot2 end-to-end check recovered — the orchestrator is replying again.', { parseMode: undefined }).catch(() => {})
+  }
+  return true
+}
 
 function startBackgroundLoops() {
   replyCheckTimer = setInterval(checkForReplies, REPLY_POLL_INTERVAL)
   escalationCheckTimer = setInterval(checkForNewEscalations, ESCALATION_POLL_INTERVAL)
+  canaryStartedAt = Date.now()
+  canaryTimer = setInterval(canaryTick, CANARY_TICK_MS)
 }
 
 function stopBackgroundLoops() {
   if (replyCheckTimer) { clearInterval(replyCheckTimer); replyCheckTimer = null }
   if (escalationCheckTimer) { clearInterval(escalationCheckTimer); escalationCheckTimer = null }
+  if (canaryTimer) { clearInterval(canaryTimer); canaryTimer = null }
 }
 
 // --- Main ---
@@ -2010,6 +2144,7 @@ async function main() {
   }
 
   chatId = config.chatId || ''
+  canaryEnabled = config.canary !== false // opt-out via telegram.canary=false
 
   // Load persisted state
   lastUpdateId = await loadLastUpdateId()

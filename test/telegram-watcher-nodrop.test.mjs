@@ -155,3 +155,36 @@ test('graceful shutdown flushes a pending message before exit', async () => {
     assert.equal(state.sent[0], 'pending during shutdown')
   } finally { await stop(proc); server.close() }
 })
+
+// Regression (2026-07-13 silent ~30-min outage): a watcher that keeps LOOPING but
+// can't SEND (network wedge) used to refresh the outbound heartbeat every cycle, so
+// the watchdog's outbound-staleness check never fired and the outage never self-healed
+// (the orchestrator had to manually restart the watcher). The heartbeat must reflect
+// "outbound healthy", not merely "loop alive": while a reply is stuck undelivered the
+// heartbeat must STOP advancing (go stale) so the watchdog restarts a fresh watcher.
+function readOutboundHeartbeat(home) {
+  const f = join(home, 'telegram-outbound-heartbeat.txt')
+  return existsSync(f) ? Number(readFileSync(f, 'utf8')) : null
+}
+test('stuck outbound stops refreshing the heartbeat (so the watchdog can catch it)', async () => {
+  const { server, state, port } = await startMockTelegram()
+  state.failSend = true
+  const home = makeHome(['stuck reply'])
+  const proc = spawnWatcher(home, port)
+  try {
+    // Let several failing cycles run, then sample the heartbeat twice ~2.5s apart.
+    await sleep(2500)
+    const hb1 = readOutboundHeartbeat(home)
+    await sleep(2500) // ~5 poll cycles at 500ms — plenty of chances to (wrongly) refresh
+    const hb2 = readOutboundHeartbeat(home)
+    assert.equal(sentCount(home), 0, 'still stuck (no delivery, no drop)')
+    assert.equal(hb2, hb1, `heartbeat must NOT advance while outbound is stuck (was ${hb1}, now ${hb2})`)
+    // Recover: delivery succeeds and the heartbeat resumes advancing (healthy again).
+    state.failSend = false
+    assert.ok(await waitFor(() => sentCount(home) === 1), 'delivers after recovery')
+    assert.ok(await waitFor(() => {
+      const hb3 = readOutboundHeartbeat(home)
+      return hb3 != null && (hb1 == null || hb3 > hb1)
+    }), 'heartbeat advances again once outbound recovers')
+  } finally { await stop(proc); server.close() }
+})

@@ -38,7 +38,7 @@ echo "Building dashboard UI..."
 # --- Copy scripts ---
 echo "Updating scripts..."
 mkdir -p "$DIR/scripts"
-for script in create-space.sh create-project.sh create-task.sh update-task.sh create-escalation.sh resolve-escalation.sh promote-escalation.sh consume-escalation.sh write-session.sh portfolio-status.sh heartbeat-cron.sh scheduler.sh lock-helper.sh update.sh restart-dashboard.sh; do
+for script in create-space.sh create-project.sh create-task.sh update-task.sh create-escalation.sh resolve-escalation.sh promote-escalation.sh consume-escalation.sh write-session.sh portfolio-status.sh heartbeat-cron.sh scheduler.sh lock-helper.sh update.sh restart-dashboard.sh restart-agents.sh; do
   if [[ -f "$REPO_DIR/scripts/$script" ]]; then
     cp "$REPO_DIR/scripts/$script" "$DIR/scripts/$script"
   fi
@@ -102,6 +102,13 @@ echo "  Templates updated"
 # --- Restart dashboard server ---
 echo "Restarting dashboard server..."
 bash "$REPO_DIR/scripts/restart-dashboard.sh"
+
+# --- Reload launchd agents so they run the code we just pulled ---
+# Long-lived daemons (wake-nudge, watchdogs) cache their code at start; without this a
+# `superbot2 update` silently leaves them on the OLD code until a manual restart (the
+# recurring stale-daemon bug — see restart-agents.sh).
+echo "Reloading launchd agents..."
+bash "$REPO_DIR/scripts/restart-agents.sh" || echo "  WARNING: some agents failed to reload"
 
 # --- Done ---
 echo ""
