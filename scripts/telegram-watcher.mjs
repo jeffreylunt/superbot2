@@ -189,6 +189,23 @@ async function fileMtimeMs(filePath) {
 // oscillation vector). team-lead.json mtime only breaks exact dashMtime ties (rare), to
 // keep the choice deterministic. Returns { inboxesDir, dashMtime } or null if none found.
 async function findCandidateInbox() {
+  // Ground truth first: the RUNNING orchestrator's own team (argv --session-id →
+  // session-<uuid8> dir). Freshness scoring below mis-resolves after every restart —
+  // the new session has no team dir yet, so "freshest" is the PREVIOUS session's and
+  // inbound messages orphan there (live 4x, 2026-07-13..16). Dynamic import so the
+  // watcher still runs even if the dashboard module is missing (partial deploy).
+  try {
+    const { liveOrchestratorTeamDir } = await import('../dashboard/active-team-inbox.mjs')
+    const liveDir = await liveOrchestratorTeamDir(TEAMS_DIR)
+    if (liveDir) {
+      const inboxesDir = join(liveDir, 'inboxes')
+      const dashMtime = await fileMtimeMs(join(inboxesDir, 'dashboard-user.json'))
+      // dashMtime may be null on a just-created team — treat as now-ish so hysteresis
+      // (which compares candidate vs current mtimes) lets the live team win.
+      return { inboxesDir, dashMtime: dashMtime ?? Date.now() }
+    }
+  } catch { /* fall through to freshness scoring */ }
+
   let teamDirs = []
   try {
     teamDirs = await readdir(TEAMS_DIR)
