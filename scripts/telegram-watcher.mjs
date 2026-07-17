@@ -2033,9 +2033,15 @@ let canaryPending = null      // { nonce, sentAt } while awaiting an ack
 let canaryAlerted = false     // latched after a failure alert until the next good ack
 
 function canaryText(nonce) {
+  // Wording matters: the restriction must be scoped to THIS message only. The first
+  // version said "Do nothing else" unqualified, and when a REAL user message arrived in
+  // the same inbox drain, the orchestrator obeyed literally and dropped it (live
+  // 2026-07-17 01:43Z: Jeff's audiobook request, delivered alongside the canary, was
+  // silently skipped). The canary must never suppress work on other messages.
   return `[canary ${nonce}] Automated end-to-end health check — reply with exactly ` +
-    `"[canary-ack ${nonce}]" via SendMessage to dashboard-user. Do nothing else: no ` +
-    `logging, no escalation, no other action.`
+    `"[canary-ack ${nonce}]" via SendMessage to dashboard-user. That is the only action ` +
+    `FOR THIS CANARY MESSAGE — but process every OTHER pending message normally, as if ` +
+    `this canary were not present.`
 }
 
 async function canaryTick() {
