@@ -51,6 +51,20 @@ const POLL_TIMEOUT = 30
 const TYPING_INTERVAL = 3000
 const REPLY_POLL_INTERVAL = Number(process.env.TG_REPLY_POLL_INTERVAL) || 3000
 const ESCALATION_POLL_INTERVAL = 10000
+// --- end-to-end canary ---------------------------------------------------------
+// Two weeks of incidents (2026-07-03..16) shared one meta-problem: each new failure mode
+// (routing orphaned, nudge blocked, model wedged, dialog stall, send-stall...) was only
+// discovered when Jeff messaged and got silence. The canary closes that: every
+// CANARY_INTERVAL_MS the watcher injects a synthetic message through the SAME inbound
+// path as a real Telegram message (dashboard POST → team inbox → orchestrator wake/nudge
+// → SendMessage → watcher relay) and expects a '[canary-ack ...]' reply, which it
+// SWALLOWS (never forwarded to Jeff). No ack within CANARY_TIMEOUT_MS ⇒ ONE direct
+// Telegram alert to Jeff naming the broken leg, latched until the next successful ack
+// ('recovered' note). Disable with telegram.canary=false in config.json.
+const CANARY_INTERVAL_MS = Number(process.env.TG_CANARY_INTERVAL_MS) || 30 * 60 * 1000
+const CANARY_TIMEOUT_MS = Number(process.env.TG_CANARY_TIMEOUT_MS) || 10 * 60 * 1000
+const CANARY_INITIAL_DELAY_MS = Number(process.env.TG_CANARY_INITIAL_DELAY_MS) || 3 * 60 * 1000
+const CANARY_TICK_MS = Number(process.env.TG_CANARY_TICK_MS) || 60 * 1000
 // Active-inbox switch hysteresis: when two team inboxes briefly look "active" (e.g. a
 // restart/handoff overlap), a naive most-recent-mtime pick can FLIP between them, and each
 // flip resets the counter to 0 and re-forwards the whole inbox → duplicate Telegram blasts.
@@ -1579,6 +1593,8 @@ async function checkForReplies() {
       const text = reply.text || reply.content || ''
       if (!text.trim()) {
         delivered = true // nothing to send — count as handled
+      } else if (handleCanaryAck(text.trim())) {
+        delivered = true // canary plumbing — swallowed, never forwarded to Jeff
       } else {
 
       // Find the correct user message to thread this reply to.
@@ -2007,15 +2023,101 @@ function sleep(ms) {
 
 let replyCheckTimer = null
 let escalationCheckTimer = null
+let canaryTimer = null
+
+// --- canary state (see CANARY_* constants for design) ---
+let canaryEnabled = true      // config.json telegram.canary !== false
+let canaryStartedAt = 0       // watcher boot time (for the initial delay)
+let canaryLastSentAt = 0
+let canaryPending = null      // { nonce, sentAt } while awaiting an ack
+let canaryAlerted = false     // latched after a failure alert until the next good ack
+
+function canaryText(nonce) {
+  return `[canary ${nonce}] Automated end-to-end health check — reply with exactly ` +
+    `"[canary-ack ${nonce}]" via SendMessage to dashboard-user. Do nothing else: no ` +
+    `logging, no escalation, no other action.`
+}
+
+async function canaryTick() {
+  if (!canaryEnabled || !chatId) return
+  const now = Date.now()
+
+  // 1. Pending canary overdue? Alert ONCE (latched), then retry on the next interval.
+  if (canaryPending && now - canaryPending.sentAt > CANARY_TIMEOUT_MS) {
+    logError(`CANARY FAILED: no ack for ${Math.round((now - canaryPending.sentAt) / 1000)}s (nonce=${canaryPending.nonce})`)
+    canaryPending = null
+    if (!canaryAlerted) {
+      canaryAlerted = true
+      try {
+        await sendMessage(
+          `⚠️ superbot2 end-to-end check failed: a synthetic message was injected ` +
+          `${Math.round(CANARY_TIMEOUT_MS / 60000)} min ago and the orchestrator never replied. ` +
+          `Inbound relay is working (this alert reached you via the same bot), so the break is in ` +
+          `the orchestrator wake/reply path. I'll keep checking and tell you when it recovers — ` +
+          `if you have the machine handy: tmux attach -t superbot2`,
+          { parseMode: undefined },
+        )
+      } catch (err) {
+        logError(`canary alert send failed: ${err.message}`)
+      }
+    }
+  }
+
+  // 2. Time to send a new canary? (initial delay after boot, then every interval)
+  const dueAt = canaryLastSentAt === 0 ? canaryStartedAt + CANARY_INITIAL_DELAY_MS : canaryLastSentAt + CANARY_INTERVAL_MS
+  if (canaryPending || now < dueAt) return
+  const nonce = Math.random().toString(36).slice(2, 8)
+  try {
+    const res = await fetch(`${DASHBOARD_API}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: canaryText(nonce) }),
+    })
+    if (!res.ok) throw new Error(`dashboard HTTP ${res.status}`)
+    canaryLastSentAt = now
+    canaryPending = { nonce, sentAt: now }
+    log(`canary sent (nonce=${nonce})`)
+  } catch (err) {
+    // The dashboard leg itself is broken — that IS a canary failure.
+    logError(`CANARY FAILED at injection (dashboard relay): ${err.message}`)
+    canaryLastSentAt = now
+    if (!canaryAlerted) {
+      canaryAlerted = true
+      await sendMessage(
+        `⚠️ superbot2 end-to-end check failed at the first leg: the dashboard relay refused the ` +
+        `synthetic message (${err.message}). Real Telegram messages are likely NOT reaching the ` +
+        `orchestrator right now.`,
+        { parseMode: undefined },
+      ).catch(() => {})
+    }
+  }
+}
+
+// Called from the reply loop when a '[canary-ack ...]' reply is seen. Returns true when
+// the reply is canary plumbing (swallow it — never forward to Jeff).
+function handleCanaryAck(text) {
+  if (!text.startsWith('[canary-ack')) return false
+  const ok = canaryPending && text.includes(canaryPending.nonce)
+  log(`canary ack received (${ok ? `${Math.round((Date.now() - canaryPending.sentAt) / 1000)}s` : 'late/unmatched'})`)
+  canaryPending = null
+  if (canaryAlerted) {
+    canaryAlerted = false
+    sendMessage('✅ superbot2 end-to-end check recovered — the orchestrator is replying again.', { parseMode: undefined }).catch(() => {})
+  }
+  return true
+}
 
 function startBackgroundLoops() {
   replyCheckTimer = setInterval(checkForReplies, REPLY_POLL_INTERVAL)
   escalationCheckTimer = setInterval(checkForNewEscalations, ESCALATION_POLL_INTERVAL)
+  canaryStartedAt = Date.now()
+  canaryTimer = setInterval(canaryTick, CANARY_TICK_MS)
 }
 
 function stopBackgroundLoops() {
   if (replyCheckTimer) { clearInterval(replyCheckTimer); replyCheckTimer = null }
   if (escalationCheckTimer) { clearInterval(escalationCheckTimer); escalationCheckTimer = null }
+  if (canaryTimer) { clearInterval(canaryTimer); canaryTimer = null }
 }
 
 // --- Main ---
@@ -2042,6 +2144,7 @@ async function main() {
   }
 
   chatId = config.chatId || ''
+  canaryEnabled = config.canary !== false // opt-out via telegram.canary=false
 
   // Load persisted state
   lastUpdateId = await loadLastUpdateId()
