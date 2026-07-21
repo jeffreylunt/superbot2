@@ -141,6 +141,24 @@ run_case '
   [ -f "$STATE_DIR/dialog-accepted" ] && [ ! -f "$RESTART_FLAG" ]
 ' && ok "boot dialog auto-confirmed, no wedge" || bad "boot dialog auto-confirmed, no wedge"
 
+# 11b. Login expired => auth repair invoked (OW_LOGIN_REPAIR_CMD), no wedge action
+run_case '
+  WEDGE_THRESHOLD_S=100
+  set_health "{\"paneFound\":true,\"paneId\":\"%9\",\"backlogAgeS\":500,\"transcriptAgeS\":600,\"transcriptBeforeBacklog\":true,\"promptEmpty\":true,\"loginExpired\":true}"
+  export OW_LOGIN_REPAIR_CMD="touch \"$STATE_DIR/login-repaired\""
+  check_wedge
+  [ -f "$STATE_DIR/login-repaired" ] && [ ! -f "$RESTART_FLAG" ]
+' && ok "login expired triggers auth repair, no wedge" || bad "login expired triggers auth repair, no wedge"
+
+# 11c. loginExpired absent/false => repair NOT invoked
+run_case '
+  WEDGE_THRESHOLD_S=100000
+  set_health "{\"paneFound\":true,\"paneId\":\"%9\",\"backlogAgeS\":null,\"transcriptAgeS\":5,\"transcriptBeforeBacklog\":false,\"promptEmpty\":true,\"loginExpired\":false}"
+  export OW_LOGIN_REPAIR_CMD="touch \"$STATE_DIR/login-repaired-11c\""
+  check_wedge
+  [ ! -f "$STATE_DIR/login-repaired-11c" ]
+' && ok "healthy login does not trigger repair" || bad "healthy login does not trigger repair"
+
 # 12. DOWN confirmation: a single probe miss must NOT relaunch (false-DOWN guard)
 run_case '
   export OW_ALIVE_CMD="false"

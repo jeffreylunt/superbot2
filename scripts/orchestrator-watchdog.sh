@@ -246,10 +246,56 @@ accept_boot_dialog() {
   return 0
 }
 
+# Auth death auto-repair (Jeff's chosen workaround, 2026-07-21): the orchestrator's
+# config-dir OAuth token dies every few hours to a rotation race with the main token it
+# was copied from. When the health probe reports loginExpired, re-copy the MAIN keychain
+# credential into the orchestrator's config-dir-scoped slot and restart claude — the
+# relaunch picks up the fresh token. Guards: the main credential must itself be VALID
+# (else skip + loud log; the canary alerts Jeff), and a cooldown stops repair loops.
+# KNOWN RISK (Jeff accepted): sharing the main refresh token; a race could someday kill
+# the MAIN session's login instead — the proper fix remains a one-time /login in the
+# orchestrator pane (see memory/superbot2-telegram-supervision.md).
+CRED_SERVICE="${OW_CRED_SERVICE:-Claude Code-credentials-4ec282a6}"
+MAIN_CRED_SERVICE="${OW_MAIN_CRED_SERVICE:-Claude Code-credentials}"
+LOGIN_REPAIR_COOLDOWN_S="${OW_LOGIN_REPAIR_COOLDOWN_S:-1800}"
+LOGIN_REPAIR_STAMP="$STATE_DIR/login-repair-at.txt"
+repair_login_expired() {
+  local json expired last now main
+  json="$1"
+  expired=$(echo "$json" | jq -r '.loginExpired' 2>/dev/null)
+  [ "$expired" = "true" ] || return 1
+  if [ -n "${OW_LOGIN_REPAIR_CMD:-}" ]; then bash -c "$OW_LOGIN_REPAIR_CMD" >/dev/null 2>&1; return 0; fi
+  now=$(date +%s)
+  last=$(cat "$LOGIN_REPAIR_STAMP" 2>/dev/null || echo 0)
+  if [ $((now - last)) -lt "$LOGIN_REPAIR_COOLDOWN_S" ]; then
+    log "login expired but repair on cooldown ($((now - last))s < ${LOGIN_REPAIR_COOLDOWN_S}s) — waiting (canary will alert Jeff if this persists)"
+    return 0
+  fi
+  main=$(security find-generic-password -s "$MAIN_CRED_SERVICE" -w 2>/dev/null || true)
+  if [ -z "$main" ] || ! echo "$main" | node -e '
+    let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
+      try{const o=JSON.parse(d).claudeAiOauth||JSON.parse(d);process.exit(o.expiresAt>Date.now()?0:1)}catch{process.exit(1)}
+    })' 2>/dev/null; then
+    log "!!! login expired AND the main credential is missing/invalid — cannot auto-repair; Jeff must /login"
+    echo "$now" > "$LOGIN_REPAIR_STAMP"
+    return 0
+  fi
+  log "login expired — re-copying main credential into '$CRED_SERVICE' and restarting claude"
+  security add-generic-password -U -a "$(id -un)" -s "$CRED_SERVICE" -w "$main" 2>/dev/null \
+    || { log "keychain write FAILED — cannot auto-repair"; echo "$now" > "$LOGIN_REPAIR_STAMP"; return 0; }
+  echo "$now" > "$LOGIN_REPAIR_STAMP"
+  # Kill the logged-out claude; the existing DOWN-detection relaunch machinery brings it
+  # back on the fresh token.
+  pkill -TERM -f "$ORCH_PATTERN" 2>/dev/null || true
+  return 0
+}
+
 check_wedge() {
   local json backlog before prompt now last
   json=$(health_json)
   [ -n "$json" ] || return 0
+  # Auth death: repair before any wedge logic — a logged-out session can't be nudged.
+  if repair_login_expired "$json"; then return 0; fi
   # A blocked startup dialog is neither healthy nor a wedge — confirm it and move on.
   if accept_boot_dialog "$json"; then return 0; fi
   backlog=$(echo "$json" | jq -r '.backlogAgeS // empty' 2>/dev/null)
