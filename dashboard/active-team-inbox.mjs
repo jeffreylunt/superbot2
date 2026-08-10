@@ -38,11 +38,13 @@ const pexecFile = promisify(execFile)
 // top-level transcript jsonl in the orchestrator config-dir's projects dir, whose
 // FILENAME is the session uuid (the same source wake-nudge trusts for turn activity;
 // the live session writes its transcript immediately at boot).
-const ORCH_ARGV_MARKER = 'claude --system-prompt # Superbot2 Orchestrator'
+// Both argv generations: legacy inline prompt, and the 2026-08-10 --system-prompt-file
+// form (see ORCH_PATTERN in orchestrator-watchdog.sh).
+const ORCH_ARGV_RE = /claude --system-prompt( # Superbot2 Orchestrator|-file .*\.orchestrator-system-prompt)/
 export async function liveOrchestratorTeamDir(teamsDir) {
   try {
     const { stdout } = await pexecFile('ps', ['-axo', 'command='], { maxBuffer: 64 * 1024 * 1024 })
-    if (!stdout.split('\n').some((l) => l.includes(ORCH_ARGV_MARKER))) return null
+    if (!stdout.split('\n').some((l) => ORCH_ARGV_RE.test(l))) return null
   } catch {
     return null
   }

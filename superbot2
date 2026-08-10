@@ -468,8 +468,17 @@ while true; do
   # which hit its usage limit and wedged the orchestrator (couldn't take a turn; Telegram
   # backed up). An explicit flag wins over settings and survives restarts. Workers pick
   # their own model per task via spawn-worker.sh --model (default opus).
+  # --system-prompt-file: the assembled prompt (template + USER.md + knowledge) crossed
+  # the OS argv/env limit on 2026-08-10 ("Argument list too long", E2BIG — claude could
+  # not even exec). A file has no such limit and keeps growing knowledge safe. The path
+  # doubles as the orchestrator's process FINGERPRINT: every liveness probe (watchdog,
+  # stranded-inbox migration, active-team resolver) matches this distinctive argv token
+  # now that the prompt text itself is no longer in argv. Rename in lockstep or the
+  # watchdog goes blind (see ORCH_PATTERN in scripts/orchestrator-watchdog.sh).
+  ORCH_PROMPT_FILE="$DIR/.orchestrator-system-prompt.md"
+  printf '%s' "$PROMPT" > "$ORCH_PROMPT_FILE"
   CLAUDE_ARGS=(
-    --system-prompt "$PROMPT"
+    --system-prompt-file "$ORCH_PROMPT_FILE"
     --session-id "$SESSION_ID"
     --model "${SUPERBOT2_ORCH_MODEL:-opus}"
     --dangerously-skip-permissions

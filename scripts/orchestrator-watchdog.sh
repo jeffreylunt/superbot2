@@ -49,7 +49,11 @@ LAUNCHER_PID_FILE="$DIR/.launcher.pid"
 # OTHER pgrep/pkill/grep processes that carry this same pattern in their own argv — without
 # it, a concurrent monitoring pgrep makes orchestrator_alive() return a false ALIVE and the
 # watchdog never relaunches (observed live 2026-07-03 16:00Z during the crash test).
-ORCH_PATTERN="claude --system-prompt # Superbot2 [O]rchestrator"
+# Two argv generations (ERE alternation): legacy inline prompt, and the 2026-08-10
+# --system-prompt-file form (prompt no longer in argv after it outgrew E2BIG; the
+# distinctive file path is the fingerprint now). Brackets keep pgrep/grep from
+# matching this pattern's own argv.
+ORCH_PATTERN="claude --system-prompt( # Superbot2 [O]rchestrator|-file .*[.]orchestrator-system-promp[t])"
 
 CHECK_INTERVAL="${OW_CHECK_INTERVAL:-30}"
 ALIVE_RETRIES="${OW_ALIVE_RETRIES:-3}"
