@@ -34,8 +34,10 @@ const SHADOW_DIR = process.env.MIGRATE_SHADOW_DIR || join(HOME_DIR, '.inbox-shad
 // never matches an ANCESTOR of the calling process, so a pgrep-based probe run from any
 // shell descended from the orchestrator itself (ops sessions, workers) would false-negative
 // (verified live 2026-07-04: pgrep exit 1 from a descendant, exit 0 from the tmux server).
+// -E alternation covers both argv generations (inline prompt / --system-prompt-file;
+// see ORCH_PATTERN in orchestrator-watchdog.sh).
 const ALIVE_CMD = process.env.MIGRATE_ALIVE_CMD
-  || 'ps ax -o command= | grep -q "claude --system-prompt # Superbot2 [O]rchestrator"'
+  || 'ps ax -o command= | grep -Eq "claude --system-prompt( # Superbot2 [O]rchestrator|-file .*[.]orchestrator-system-promp[t])"'
 
 const dryRun = process.argv.includes('--dry-run')
 const verbose = process.argv.includes('--verbose') || dryRun

@@ -341,12 +341,15 @@ async function healthSnapshot() {
     // submit a rating). Observed live 2026-07-17 02:28Z: it modally blocked the
     // orchestrator ~25 min — messages queued unread until the canary alert fired.
     feedbackDialog: plainCap != null && /0: Dismiss/.test(plainCap) && /1: Bad/.test(plainCap),
-    // Auth death (live 2026-07-20 + 2026-07-21): the orchestrator's config-dir OAuth token
-    // expires (shared-token rotation race) and every message answers "Login expired".
-    // Match the STATUS-BAR text ("Not logged in · Run /login") — it's rendered by the TUI
-    // chrome, not message content, so orchestrator text QUOTING these words can't false-
-    // positive as easily as the ⏺ result lines would. The watchdog auto-repairs on this.
-    loginExpired: plainCap != null && /Not logged in · Run \/login/.test(plainCap),
+    // Auth death (live 2026-07-20 + 2026-07-21 x2): the orchestrator's config-dir OAuth
+    // token expires (shared-token rotation race) and every message answers "Login
+    // expired". Two renderings observed live: the status-bar "Not logged in · Run /login"
+    // (TUI chrome) AND — 2026-07-21 18:00Z — sessions where ONLY the ⏺ result line
+    // "⏺ Login expired · Please run /login" appears (footer absent), which the
+    // footer-only match MISSED for an hour of failed canaries. Match both; the ⏺-prefixed
+    // exact line keeps quoted/echoed content from false-positiving. Watchdog auto-repairs.
+    loginExpired: plainCap != null &&
+      (/Not logged in · Run \/login/.test(plainCap) || /⏺ Login expired · Please run \/login/.test(plainCap)),
   }
 }
 
