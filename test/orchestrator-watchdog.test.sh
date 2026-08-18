@@ -150,6 +150,16 @@ run_case '
   [ -f "$STATE_DIR/login-repaired" ] && [ ! -f "$RESTART_FLAG" ]
 ' && ok "login expired triggers auth repair, no wedge" || bad "login expired triggers auth repair, no wedge"
 
+# 11d. Dangerous-op permission gate => auto-DENY (OW_DENY_CMD), no wedge action
+run_case '
+  WEDGE_THRESHOLD_S=100
+  set_health "{\"paneFound\":true,\"paneId\":\"%9\",\"backlogAgeS\":500,\"transcriptAgeS\":600,\"transcriptBeforeBacklog\":true,\"promptEmpty\":false,\"dangerOpDialog\":true}"
+  export OW_DENY_CMD="touch \"$STATE_DIR/danger-denied\""
+  export OW_LAUNCHER_ALIVE_CMD="true"
+  check_wedge
+  [ -f "$STATE_DIR/danger-denied" ] && [ ! -f "$RESTART_FLAG" ]
+' && ok "dangerous-op gate auto-denied, no wedge" || bad "dangerous-op gate auto-denied, no wedge"
+
 # 11c. loginExpired absent/false => repair NOT invoked
 run_case '
   WEDGE_THRESHOLD_S=100000

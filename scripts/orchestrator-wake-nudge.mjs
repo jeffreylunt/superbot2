@@ -350,6 +350,14 @@ async function healthSnapshot() {
     // exact line keeps quoted/echoed content from false-positiving. Watchdog auto-repairs.
     loginExpired: plainCap != null &&
       (/Not logged in · Run \/login/.test(plainCap) || /⏺ Login expired · Please run \/login/.test(plainCap)),
+    // Hard permission gate (fires even under bypass-permissions — e.g. "Dangerous rm
+    // operation on statically-unresolvable target", live 2026-08-18: an rm of the ENTIRE
+    // runtime dir sat blocking with the cursor on "Yes" until manually cancelled). Jeff's
+    // policy (2026-08-18): superbot must never freeze on a dialog — the watchdog
+    // auto-DENIES these (Esc). Never auto-confirm: the safe unblocking answer is always
+    // "no"; the orchestrator sees the denial and routes around it.
+    dangerOpDialog: plainCap != null &&
+      /Do you want to proceed\?/.test(plainCap) && /Esc to cancel/.test(plainCap),
   }
 }
 
