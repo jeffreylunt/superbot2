@@ -227,12 +227,24 @@ kill_orphan_claude() {
 # relaunch the same $HOME workspace + repo config Jeff already trusts, and we only press
 # Enter when the health probe positively identifies a known boot dialog.
 accept_boot_dialog() {
-  local json dialog feedback pane
+  local json dialog feedback danger pane
   json="$1"
   dialog=$(echo "$json" | jq -r '.bootDialog' 2>/dev/null)
   feedback=$(echo "$json" | jq -r '.feedbackDialog' 2>/dev/null)
+  danger=$(echo "$json" | jq -r '.dangerOpDialog' 2>/dev/null)
   pane=$(echo "$json" | jq -r '.paneId // empty' 2>/dev/null)
   [ -n "$pane" ] || return 1
+  # Hard permission gate (dangerous rm etc., surfaces even under bypass-permissions).
+  # Jeff's policy 2026-08-18: never freeze on a dialog — auto-DENY (Esc). NEVER confirm:
+  # the live 2026-08-18 instance was `rm /Users/jeff/.superbot2/*` with cursor on "Yes";
+  # denial is always the safe unblocking answer, the orchestrator routes around it.
+  if [ "$danger" = "true" ]; then
+    log "!!! dangerous-op permission gate detected in pane $pane — auto-DENYING (Esc); the orchestrator must work around the denied command"
+    if [ -n "${OW_DENY_CMD:-}" ]; then bash -c "$OW_DENY_CMD" >/dev/null 2>&1; else
+      tmux send-keys -t "$pane" Escape 2>/dev/null || true
+    fi
+    return 0
+  fi
   # Feedback/rating modal ("1: Bad ... 0: Dismiss") — press '0' to DISMISS. Enter would
   # submit a rating. Blocked the orchestrator ~25 min live 2026-07-17 until dismissed.
   if [ "$feedback" = "true" ]; then
