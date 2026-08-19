@@ -324,3 +324,50 @@ test('wake sentinel is short enough to not wrap, and prefix-match recognizes a w
   assert.ok(!looksLikeSentinel(''), 'empty is not the sentinel')
   assert.ok(!looksLikeSentinel('push on build-pipeline-v2'), 'unrelated text is not the sentinel')
 })
+
+// --- unanswered-user gate (live 2026-08-19: 5th answered-into-the-void incident) ---
+// The inbox is DRAINED (no unread backlog) yet the newest dashboard-user message has no
+// NEWER outbound reply: the orchestrator took its turn and answered as pane text without
+// SendMessage. decideNudge must fire 'unanswered-user' — with all the usual safety gates.
+test('drained inbox + no newer reply => unanswered-user nudge', () => {
+  const now = 1_000_000_000
+  const r = decideNudge(passing({
+    nowMs: now,
+    newestUnprocessedMs: null, // drained
+    newestUserMsgMs: now - 400_000, // user msg 6.7 min ago (> answerGraceMs)
+    newestReplyMs: now - 900_000,   // last reply predates it
+  }), { ...CFG, answerGraceMs: 300_000 })
+  assert.equal(r.nudge, true)
+  assert.equal(r.reason, 'unanswered-user')
+})
+
+test('a NEWER outbound reply suppresses the unanswered-user nudge', () => {
+  const now = 1_000_000_000
+  const r = decideNudge(passing({
+    nowMs: now,
+    newestUnprocessedMs: null,
+    newestUserMsgMs: now - 400_000,
+    newestReplyMs: now - 100_000, // replied after the message
+  }), { ...CFG, answerGraceMs: 300_000 })
+  assert.equal(r.nudge, false)
+  assert.equal(r.reason, 'no-backlog')
+})
+
+test('unanswered-user respects answer grace, cooldown, and pending prompt text', () => {
+  const now = 1_000_000_000
+  const base = { nowMs: now, newestUnprocessedMs: null, newestUserMsgMs: now - 400_000, newestReplyMs: null }
+  const cfg = { ...CFG, answerGraceMs: 300_000 }
+  // Within grace: user msg only 2 min old
+  assert.equal(decideNudge(passing({ ...base, newestUserMsgMs: now - 120_000 }), cfg).reason, 'no-backlog')
+  // Cooldown active
+  assert.equal(decideNudge(passing({ ...base, lastNudgeMs: now - 10_000 }), cfg).reason, 'cooldown')
+  // Pending user text in the prompt — never clobber
+  assert.equal(decideNudge(passing({ ...base, promptEmpty: false }), cfg).reason, 'prompt-not-empty')
+  // Mid-turn
+  assert.equal(decideNudge(passing({ ...base, transcriptMtimeMs: now - 1_000 }), cfg).reason, 'transcript-recent')
+})
+
+test('legacy callers without user/reply times keep old behavior', () => {
+  const r = decideNudge(passing({ newestUnprocessedMs: null }), CFG)
+  assert.equal(r.reason, 'no-backlog')
+})
