@@ -279,14 +279,27 @@ assemble_prompt() {
 
   # --- Pre-load context ---
 
-  # Knowledge files
+  # Knowledge files — BUDGETED (2026-08-24 incident: unbounded inlining grew the prompt
+  # to 2.59MB / ~650k tokens; fresh sessions booted at 100% context, compaction could not
+  # go below the limit, superbot2 could not run AT ALL). Files small enough are inlined
+  # whole; oversized files (and anything past the total budget) get a stub pointing at
+  # the on-disk path so the orchestrator Reads them on demand. Data on disk is untouched.
+  local K_FILE_MAX=$(( ${SUPERBOT2_KNOWLEDGE_FILE_MAX_KB:-24} * 1024 ))
+  local K_TOTAL_MAX=$(( ${SUPERBOT2_KNOWLEDGE_TOTAL_MAX_KB:-256} * 1024 ))
+  local k_used=0 k_size
   local kfiles=("$DIR"/knowledge/*)
   if [[ ${#kfiles[@]} -gt 0 ]]; then
-    prompt+=$'\n\n## Knowledge\n'
+    prompt+=$'\n\n## Knowledge\n\nInlined below only when small; oversized/overflow entries show a path — Read them on demand.\n'
     for f in "${kfiles[@]}"; do
       [[ -f "$f" ]] || continue
-      prompt+=$'\n### '"$(basename "$f")"$'\n\n'
-      prompt+=$(cat "$f")
+      k_size=$(stat -f%z "$f" 2>/dev/null || echo 0)
+      if (( k_size <= K_FILE_MAX && k_used + k_size <= K_TOTAL_MAX )); then
+        prompt+=$'\n### '"$(basename "$f")"$'\n\n'
+        prompt+=$(cat "$f")
+        k_used=$(( k_used + k_size ))
+      else
+        prompt+=$'\n### '"$(basename "$f")"$' (not inlined — '"$(( k_size / 1024 ))"$'KB; Read '"$f"$' when needed)\n'
+      fi
     done
   fi
 
