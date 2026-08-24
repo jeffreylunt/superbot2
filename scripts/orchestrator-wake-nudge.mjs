@@ -85,6 +85,42 @@ async function readInboxMtimeMs() {
   }
 }
 
+// --- inbound-vs-outbound times (unanswered-user gate) -----------------------
+// newestUserMsgMs: newest dashboard-user message in team-lead.json, READ OR UNREAD —
+// a drained inbox is exactly the answered-into-the-void case this gate exists for.
+// newestReplyMs: newest team-lead reply in dashboard-user.json. Canary traffic is
+// excluded on BOTH sides so an acked canary can't mask an unanswered Jeff message
+// (and an unacked one can't spuriously trigger; the canary has its own alerting).
+async function readUserReplyTimes() {
+  const empty = { newestUserMsgMs: null, newestReplyMs: null }
+  const inboxesDir = await resolveActiveTeamInboxesDir(TEAMS_DIR, {
+    pinnedTeam: process.env.SUPERBOT2_NAME || '',
+    fallbackInboxesDir: null,
+  })
+  if (!inboxesDir) return empty
+  const ts = (m) => {
+    const t = Date.parse(m.timestamp || '')
+    return Number.isFinite(t) ? t : null
+  }
+  const newestOf = (arr, pred) => arr.reduce((best, m) => {
+    if (!pred(m)) return best
+    const t = ts(m)
+    return t !== null && (best === null || t > best) ? t : best
+  }, null)
+  try {
+    const inbox = JSON.parse(await readFile(join(inboxesDir, 'team-lead.json'), 'utf-8'))
+    const outbox = JSON.parse(await readFile(join(inboxesDir, 'dashboard-user.json'), 'utf-8'))
+    return {
+      newestUserMsgMs: newestOf(inbox, (m) =>
+        m.from === 'dashboard-user' && !String(m.text || '').startsWith('[canary ')),
+      newestReplyMs: newestOf(outbox, (m) =>
+        m.from === 'team-lead' && !String(m.text || '').startsWith('[canary-ack')),
+    }
+  } catch {
+    return empty // fail closed: gate never fires on unreadable state
+  }
+}
+
 // --- transcript mtime (orchestrator turn activity) -------------------------
 // The freshest jsonl in the projects dir is the live orchestrator transcript; it advances while
 // a turn streams. (We use the freshest rather than a fixed session id so a context-fill restart
@@ -228,10 +264,19 @@ async function capturePane() {
 const WAKE_TEXT = (process.env.WAKE_NUDGE_TEXT ||
   '[wake-nudge] process your pending inbox')
   .replace(/[\r\n]+/g, ' ').trim()
+// Unanswered-user variant: the message is already READ, so "process pending" would find
+// nothing ("Idle — nothing to process", the exact trap). This sentinel must send it back
+// into HISTORY. Kept short (one pane line) like WAKE_TEXT.
+const WAKE_TEXT_UNANSWERED = (process.env.WAKE_NUDGE_UNANSWERED_TEXT ||
+  '[wake-nudge] answer Jeff via SendMessage')
+  .replace(/[\r\n]+/g, ' ').trim()
 
 function sleepMs(ms) { return new Promise((r) => setTimeout(r, ms)) }
 
-async function sendNudge() {
+async function sendNudge(reason) {
+  // Reason-specific sentinel: 'unanswered-user' must point at HISTORY (message already
+  // read); everything else uses the pending-inbox text.
+  const text = reason === 'unanswered-user' ? WAKE_TEXT_UNANSWERED : WAKE_TEXT
   const pane = await discoverPane()
   if (!pane) { log('sendNudge: no pane resolved, skipping'); return }
   if (DRY_RUN) { log(`DRY-RUN: would submit wake sentinel to pane ${pane}`); return }
@@ -247,7 +292,7 @@ async function sendNudge() {
 
   // '--' ends tmux option parsing so an operator-set WAKE_NUDGE_TEXT starting with '-' can't
   // be misread as send-keys flags (review M1). -l types it literally (no key-name lookup).
-  await pexecFile('tmux', ['send-keys', '-t', pane, '-l', '--', WAKE_TEXT])
+  await pexecFile('tmux', ['send-keys', '-t', pane, '-l', '--', text])
 
   // Post-type verify (review I1 belt-and-suspenders): only press Enter once the prompt shows
   // our sentinel. Accept an exact match OR a non-empty PREFIX of it: a long prompt wraps in
@@ -255,7 +300,7 @@ async function sendNudge() {
   // which aborted real nudges and left stuck text on 2026-07-15. A prefix is safe here because
   // the pre-type race guard already proved the prompt was empty, so a prefix of our own text
   // can only be our wrapped sentinel, never stray user input. Retry briefly: the UI may lag.
-  const looksLikeSentinel = (t) => typeof t === 'string' && t.length > 0 && WAKE_TEXT.startsWith(t)
+  const looksLikeSentinel = (t) => typeof t === 'string' && t.length > 0 && text.startsWith(t)
   let typed = null
   for (let i = 0; i < 6; i++) {
     await sleepMs(150)
@@ -280,6 +325,7 @@ const deps = {
   nowMs: () => Date.now(),
   readInboxMtimeMs,
   readTranscriptMtimeMs,
+  readUserReplyTimes,
   capturePane,
   getTitle,
   sendNudge,
@@ -358,6 +404,19 @@ async function healthSnapshot() {
     // "no"; the orchestrator sees the denial and routes around it.
     dangerOpDialog: plainCap != null &&
       /Do you want to proceed\?/.test(plainCap) && /Esc to cancel/.test(plainCap),
+    // Hard context exhaustion (live 2026-08-24): every turn aborts instantly with
+    // "Context limit reached · /compact or /clear to continue" — the orchestrator can't
+    // think at all, canaries fail, and the aborted micro-turns advance the transcript
+    // enough to fool the transcript-after-message gate into "handled". Excluded while a
+    // compaction is already running so the watchdog doesn't stack /compact commands.
+    contextFull: plainCap != null &&
+      /Context limit reached · \/compact or \/clear to continue/.test(plainCap) &&
+      !/Compacting conversation/.test(plainCap),
+    // Compaction gave up (live 2026-08-24: "Compaction failed · conversation could not
+    // be reduced below the context limit" — a 1.39MB fixed system prompt leaves nothing
+    // to reclaim). The session is unrecoverable; the only exit is a fresh session.
+    compactFailed: plainCap != null &&
+      /Compaction failed · conversation could not be reduced/.test(plainCap),
   }
 }
 

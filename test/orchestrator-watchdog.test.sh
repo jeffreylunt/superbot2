@@ -160,6 +160,38 @@ run_case '
   [ -f "$STATE_DIR/danger-denied" ] && [ ! -f "$RESTART_FLAG" ]
 ' && ok "dangerous-op gate auto-denied, no wedge" || bad "dangerous-op gate auto-denied, no wedge"
 
+# 11e. Context limit reached => auto-/compact (OW_COMPACT_CMD), no wedge action
+run_case '
+  WEDGE_THRESHOLD_S=100
+  set_health "{\"paneFound\":true,\"paneId\":\"%9\",\"backlogAgeS\":500,\"transcriptAgeS\":600,\"transcriptBeforeBacklog\":true,\"promptEmpty\":true,\"contextFull\":true}"
+  export OW_COMPACT_CMD="touch \"$STATE_DIR/compacted\""
+  export OW_LAUNCHER_ALIVE_CMD="true"
+  check_wedge
+  [ -f "$STATE_DIR/compacted" ] && [ ! -f "$RESTART_FLAG" ]
+' && ok "context-full auto-compacts, no wedge" || bad "context-full auto-compacts, no wedge"
+
+# 11f. Compact cooldown: second detection within the window does NOT re-fire
+run_case '
+  WEDGE_THRESHOLD_S=100
+  set_health "{\"paneFound\":true,\"paneId\":\"%9\",\"backlogAgeS\":500,\"transcriptAgeS\":600,\"transcriptBeforeBacklog\":true,\"promptEmpty\":true,\"contextFull\":true}"
+  export OW_COMPACT_CMD="touch \"$STATE_DIR/compacted-again\""
+  export OW_LAUNCHER_ALIVE_CMD="true"
+  date +%s > "$STATE_DIR/compact-at.txt"
+  check_wedge
+  [ ! -f "$STATE_DIR/compacted-again" ]
+' && ok "compact cooldown holds" || bad "compact cooldown holds"
+
+# 11g. Compaction failed => fresh-session restart (OW_FRESH_RESTART_CMD), not /compact
+run_case '
+  WEDGE_THRESHOLD_S=100
+  set_health "{\"paneFound\":true,\"paneId\":\"%9\",\"backlogAgeS\":500,\"transcriptAgeS\":600,\"transcriptBeforeBacklog\":true,\"promptEmpty\":true,\"contextFull\":true,\"compactFailed\":true}"
+  export OW_FRESH_RESTART_CMD="touch \"$STATE_DIR/fresh-restarted\""
+  export OW_COMPACT_CMD="touch \"$STATE_DIR/compacted-wrongly\""
+  export OW_LAUNCHER_ALIVE_CMD="true"
+  check_wedge
+  [ -f "$STATE_DIR/fresh-restarted" ] && [ ! -f "$STATE_DIR/compacted-wrongly" ]
+' && ok "compaction failure forces fresh restart" || bad "compaction failure forces fresh restart"
+
 # 11c. loginExpired absent/false => repair NOT invoked
 run_case '
   WEDGE_THRESHOLD_S=100000

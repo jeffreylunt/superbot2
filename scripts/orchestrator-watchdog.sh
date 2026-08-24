@@ -234,6 +234,42 @@ accept_boot_dialog() {
   danger=$(echo "$json" | jq -r '.dangerOpDialog' 2>/dev/null)
   pane=$(echo "$json" | jq -r '.paneId // empty' 2>/dev/null)
   [ -n "$pane" ] || return 1
+  # Hard context exhaustion (live 2026-08-24): the session can't take ANY turn until
+  # compacted — auto-run /compact. Cooldown (default 15 min) because compaction of a
+  # full session takes minutes and the probe excludes only VISIBLE "Compacting…" text;
+  # without it, scrolled-away progress could trigger a duplicate /compact submit.
+  # Compaction FAILED => the session is beyond saving (fixed prompt too large to reduce
+  # under the limit, live 2026-08-24). Kill claude WITHOUT the .restart flag: the launcher
+  # exits, the DOWN path relaunches a FRESH session (a .restart --resume would reload the
+  # same full session). Stranded messages replay via the inbox migration.
+  local cfailed
+  cfailed=$(echo "$json" | jq -r '.compactFailed' 2>/dev/null)
+  if [ "$cfailed" = "true" ]; then
+    log "!!! compaction FAILED — session unrecoverable, killing claude for a fresh-session relaunch"
+    if [ -n "${OW_FRESH_RESTART_CMD:-}" ]; then bash -c "$OW_FRESH_RESTART_CMD" >/dev/null 2>&1; else
+      pkill -TERM -f "$ORCH_PATTERN" 2>/dev/null || true
+    fi
+    return 0
+  fi
+  local ctxfull
+  ctxfull=$(echo "$json" | jq -r '.contextFull' 2>/dev/null)
+  if [ "$ctxfull" = "true" ]; then
+    local now_s last_s
+    now_s=$(date +%s)
+    last_s=$(cat "$STATE_DIR/compact-at.txt" 2>/dev/null || echo 0)
+    if [ $((now_s - last_s)) -lt "${OW_COMPACT_COOLDOWN_S:-900}" ]; then
+      log "context full but /compact on cooldown ($((now_s - last_s))s) — waiting"
+      return 0
+    fi
+    log "!!! context limit reached — auto-running /compact in pane $pane"
+    echo "$now_s" > "$STATE_DIR/compact-at.txt"
+    if [ -n "${OW_COMPACT_CMD:-}" ]; then bash -c "$OW_COMPACT_CMD" >/dev/null 2>&1; else
+      tmux send-keys -t "$pane" -l -- "/compact" 2>/dev/null || true
+      sleep 1
+      tmux send-keys -t "$pane" Enter 2>/dev/null || true
+    fi
+    return 0
+  fi
   # Hard permission gate (dangerous rm etc., surfaces even under bypass-permissions).
   # Jeff's policy 2026-08-18: never freeze on a dialog — auto-DENY (Esc). NEVER confirm:
   # the live 2026-08-18 instance was `rm /Users/jeff/.superbot2/*` with cursor on "Yes";
