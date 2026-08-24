@@ -404,6 +404,14 @@ async function healthSnapshot() {
     // "no"; the orchestrator sees the denial and routes around it.
     dangerOpDialog: plainCap != null &&
       /Do you want to proceed\?/.test(plainCap) && /Esc to cancel/.test(plainCap),
+    // Hard context exhaustion (live 2026-08-24): every turn aborts instantly with
+    // "Context limit reached · /compact or /clear to continue" — the orchestrator can't
+    // think at all, canaries fail, and the aborted micro-turns advance the transcript
+    // enough to fool the transcript-after-message gate into "handled". Excluded while a
+    // compaction is already running so the watchdog doesn't stack /compact commands.
+    contextFull: plainCap != null &&
+      /Context limit reached · \/compact or \/clear to continue/.test(plainCap) &&
+      !/Compacting conversation/.test(plainCap),
   }
 }
 
