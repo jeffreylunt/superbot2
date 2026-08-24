@@ -238,6 +238,19 @@ accept_boot_dialog() {
   # compacted — auto-run /compact. Cooldown (default 15 min) because compaction of a
   # full session takes minutes and the probe excludes only VISIBLE "Compacting…" text;
   # without it, scrolled-away progress could trigger a duplicate /compact submit.
+  # Compaction FAILED => the session is beyond saving (fixed prompt too large to reduce
+  # under the limit, live 2026-08-24). Kill claude WITHOUT the .restart flag: the launcher
+  # exits, the DOWN path relaunches a FRESH session (a .restart --resume would reload the
+  # same full session). Stranded messages replay via the inbox migration.
+  local cfailed
+  cfailed=$(echo "$json" | jq -r '.compactFailed' 2>/dev/null)
+  if [ "$cfailed" = "true" ]; then
+    log "!!! compaction FAILED — session unrecoverable, killing claude for a fresh-session relaunch"
+    if [ -n "${OW_FRESH_RESTART_CMD:-}" ]; then bash -c "$OW_FRESH_RESTART_CMD" >/dev/null 2>&1; else
+      pkill -TERM -f "$ORCH_PATTERN" 2>/dev/null || true
+    fi
+    return 0
+  fi
   local ctxfull
   ctxfull=$(echo "$json" | jq -r '.contextFull' 2>/dev/null)
   if [ "$ctxfull" = "true" ]; then

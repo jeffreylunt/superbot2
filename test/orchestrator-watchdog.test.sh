@@ -181,6 +181,17 @@ run_case '
   [ ! -f "$STATE_DIR/compacted-again" ]
 ' && ok "compact cooldown holds" || bad "compact cooldown holds"
 
+# 11g. Compaction failed => fresh-session restart (OW_FRESH_RESTART_CMD), not /compact
+run_case '
+  WEDGE_THRESHOLD_S=100
+  set_health "{\"paneFound\":true,\"paneId\":\"%9\",\"backlogAgeS\":500,\"transcriptAgeS\":600,\"transcriptBeforeBacklog\":true,\"promptEmpty\":true,\"contextFull\":true,\"compactFailed\":true}"
+  export OW_FRESH_RESTART_CMD="touch \"$STATE_DIR/fresh-restarted\""
+  export OW_COMPACT_CMD="touch \"$STATE_DIR/compacted-wrongly\""
+  export OW_LAUNCHER_ALIVE_CMD="true"
+  check_wedge
+  [ -f "$STATE_DIR/fresh-restarted" ] && [ ! -f "$STATE_DIR/compacted-wrongly" ]
+' && ok "compaction failure forces fresh restart" || bad "compaction failure forces fresh restart"
+
 # 11c. loginExpired absent/false => repair NOT invoked
 run_case '
   WEDGE_THRESHOLD_S=100000

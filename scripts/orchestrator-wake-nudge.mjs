@@ -412,6 +412,11 @@ async function healthSnapshot() {
     contextFull: plainCap != null &&
       /Context limit reached · \/compact or \/clear to continue/.test(plainCap) &&
       !/Compacting conversation/.test(plainCap),
+    // Compaction gave up (live 2026-08-24: "Compaction failed · conversation could not
+    // be reduced below the context limit" — a 1.39MB fixed system prompt leaves nothing
+    // to reclaim). The session is unrecoverable; the only exit is a fresh session.
+    compactFailed: plainCap != null &&
+      /Compaction failed · conversation could not be reduced/.test(plainCap),
   }
 }
 
