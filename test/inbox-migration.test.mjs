@@ -76,7 +76,9 @@ test('replays only unprocessed messages: after lead activity cutoff, unread, non
     configAgeMs: 20 * HOUR,
     leadInbox: [
       msg('dashboard-user', '2026-07-03T20:00:00.000Z', 'processed long ago'),
-      msg('scheduler', '2026-07-04T05:00:00.000Z', 'stranded job A'),
+      // scheduler.sh stamps type:"scheduled_job" on every job message — the fixture MUST
+      // carry it, or this test asserts against a shape production never produces.
+      msg('scheduler', '2026-07-04T05:00:00.000Z', 'stranded job A', { type: 'scheduled_job' }),
       msg('dashboard-user', '2026-07-04T05:30:00.000Z', 'stranded user msg', { extraField: 'kept' }),
       msg('worker-x', '2026-07-04T05:40:00.000Z', '{"type":"idle_notification","from":"worker-x"}'),
       msg('heartbeat', '2026-07-04T05:45:00.000Z', 'heartbeat backlog'),
@@ -404,7 +406,19 @@ test('isControlMessage classification', () => {
   assert.equal(isControlMessage(msg('w', '2026-07-04T05:00:00.000Z', '{"type":"idle_notification"}')), true)
   assert.equal(isControlMessage(msg('w', '2026-07-04T05:00:00.000Z', '{"not":"control"}')), false)
   assert.equal(isControlMessage(msg('w', '2026-07-04T05:00:00.000Z', '{broken json')), false)
-  assert.equal(isControlMessage(msg('scheduler', '2026-07-04T05:00:00.000Z', 'Scheduled job due')), false)
+  // PRODUCTION SHAPE: scheduler.sh stamps type:"scheduled_job", the dashboard/relay stamp
+  // type:"message". A bare `m.type` test classifies BOTH as ephemeral chatter and the
+  // migration silently drops them — the exact incident this module exists to prevent
+  // (live 2026-08-24: 10 scheduler jobs dropped from session-d41d108a). Only the
+  // enumerated ephemeral types are control.
+  assert.equal(isControlMessage(msg('scheduler', '2026-07-04T05:00:00.000Z', 'Scheduled job due', { type: 'scheduled_job' })), false)
+  assert.equal(isControlMessage(msg('dashboard-user', '2026-07-04T05:00:00.000Z', 'a real message', { type: 'message' })), false)
+  assert.equal(isControlMessage(msg('worker-x', '2026-07-04T05:00:00.000Z', 'worker report', { type: 'message' })), false)
+  // Ephemeral types stay control even from a non-heartbeat sender.
+  assert.equal(isControlMessage(msg('relay', '2026-07-04T05:00:00.000Z', 'x', { type: 'heartbeat' })), true)
+  assert.equal(isControlMessage(msg('worker-x', '2026-07-04T05:00:00.000Z', 'x', { type: 'idle_notification' })), true)
+  // An UNKNOWN type must default to durable — dropping real work is the worse failure.
+  assert.equal(isControlMessage(msg('worker-x', '2026-07-04T05:00:00.000Z', 'x', { type: 'some_future_type' })), false)
 })
 
 test('messageId is stable and field-sensitive', () => {

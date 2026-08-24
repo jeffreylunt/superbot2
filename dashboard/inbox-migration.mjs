@@ -68,12 +68,39 @@ export function migrationHopsOf(m) {
   return 0
 }
 
+// Ephemeral `type` values — an ALLOW-LIST, deliberately, not a bare `m.type` truthiness
+// test. Enumerated from what actually appears in real inboxes (2026-08-24 sweep of
+// .claude/teams + .inbox-shadow): only "message" (dashboard/relay/worker SendMessage),
+// "scheduled_job" (scheduler.sh) and "heartbeat" occur, and the first two are DURABLE
+// WORK. A truthiness test classified every scheduled job as chatter, so the migration
+// dropped them — see the incident note on isControlMessage below.
+//
+// An unrecognised type falls through to DURABLE on purpose: replaying something stale is
+// recoverable ("use judgment before acting" is stamped on every replay), losing real work
+// silently is not. Add a type here only once it is known to be regenerated after a restart.
+const EPHEMERAL_TYPES = new Set([
+  'heartbeat', // regenerated every 30 min
+  'idle_notification', // references agents of the dead session
+  'shutdown_approval',
+  'shutdown_approved',
+])
+
 // Control/ephemeral chatter that must NOT be replayed into a new session: heartbeats are
 // regenerated every 30 min, and JSON control envelopes (idle_notification,
 // shutdown_approved, ...) reference agents of the dead session.
+//
+// 🔴 DO NOT reduce this to `|| m.type`. That bug shipped and cost real work: on
+// 2026-08-24 every scheduler message (scheduler.sh stamps type:"scheduled_job") was
+// classified as chatter, and ten jobs — email-triage, personal-email-triage,
+// hostreply-support-inbox, personal-imessage-check, stream-cloudflare-check,
+// rental-property-notes-sync, jmp-daily-prospect-scrape, jedd-sweep-full,
+// chrome-tab-cleanup, hostreply-social-queue-replenish — died with session-d41d108a.
+// That is precisely the incident described in this file's header, re-created by the
+// guard meant to prevent it. A `scheduled_job` is durable work, not chatter.
 export function isControlMessage(m) {
   if (!m || typeof m !== 'object') return true
-  if (m.from === 'heartbeat' || m.type) return true
+  if (m.from === 'heartbeat') return true
+  if (m.type && EPHEMERAL_TYPES.has(m.type)) return true
   const text = (m.text || '').trim()
   if (text.startsWith('{')) {
     try {
