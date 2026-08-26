@@ -35,6 +35,7 @@ bash "$DIR/update-task-notes.test.sh"
 echo
 echo "=== unit (node) tests ==="
 node --test --test-concurrency=1 \
+  "$DIR/relay-filter.test.mjs" \
   "$DIR/active-team-inbox.test.mjs" \
   "$DIR/ensure-dashboard-user.test.mjs" \
   "$DIR/inbound-message-write.test.mjs" \

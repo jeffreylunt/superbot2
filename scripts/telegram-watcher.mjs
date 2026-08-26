@@ -15,12 +15,20 @@ import { existsSync } from 'node:fs'
 import { join, basename, extname } from 'node:path'
 import { homedir } from 'node:os'
 import { execFile } from 'node:child_process'
+// Which outbox entries get relayed, how non-team-lead senders are labelled, and the one-time
+// counter translation the 2026-08-26 widening required. See scripts/relay-filter.mjs for why
+// this is a static sibling import rather than the dynamic one used for the dashboard module.
+import { isRelayableReply, labelReplyText, translateReplyCounter } from './relay-filter.mjs'
 
 const SUPERBOT_DIR = process.env.SUPERBOT2_HOME || join(homedir(), '.superbot2')
 const SPACES_DIR = join(SUPERBOT_DIR, 'spaces')
 const CONFIG_PATH = join(SUPERBOT_DIR, 'config.json')
 const PID_FILE = join(SUPERBOT_DIR, 'telegram.pid')
 const LAST_SENT_FILE = join(SUPERBOT_DIR, 'telegram-last-sent-idx.txt')
+// Written once, after LAST_SENT_FILE's contents have been translated from the old
+// team-lead-only index space to the widened one (see translateReplyCounter). Its EXISTENCE is
+// the whole state — the translation is not idempotent, so it must run exactly once.
+const RELAY_FILTER_V2_MARKER = join(SUPERBOT_DIR, 'telegram-last-sent-idx.filter-v2')
 const LAST_UPDATE_ID_FILE = join(SUPERBOT_DIR, 'telegram-last-update-id.txt')
 const SENT_ESCALATIONS_FILE = join(SUPERBOT_DIR, 'telegram-sent-escalations.json')
 const MESSAGE_MAP_FILE = join(SUPERBOT_DIR, 'telegram-message-map.json')
@@ -690,6 +698,35 @@ async function loadLastSentCount() {
   }
 }
 
+// Run exactly once, at startup, before anything else reads lastSentReplyCount. Guarded by the
+// EXISTENCE of RELAY_FILTER_V2_MARKER because the translation is not idempotent — applying it
+// twice would walk a counter that is already in the new index space.
+//
+// On any failure the counter is left ALONE. An untranslated counter can at worst re-send a
+// short tail; a counter mangled by a half-completed translation can skip messages silently,
+// and silent loss is the failure mode this whole change exists to remove.
+async function migrateReplyCounterForWidenedFilter() {
+  try {
+    await stat(RELAY_FILTER_V2_MARKER)
+    return // already translated on a previous run
+  } catch { /* not translated yet */ }
+
+  try {
+    const inbox = (await readJsonFile(join(TEAM_INBOXES_DIR, 'dashboard-user.json'))) || []
+    const oldCount = lastSentReplyCount
+    const newCount = translateReplyCounter(inbox, oldCount)
+    if (newCount !== oldCount) {
+      lastSentReplyCount = newCount
+      await saveLastSentCount(lastSentReplyCount)
+    }
+    await writeFile(RELAY_FILTER_V2_MARKER, new Date().toISOString(), 'utf-8')
+    log(`Relay filter widened to all senders: outbound counter ${oldCount} -> ${newCount} (inbox=${inbox.length}, relayable=${inbox.filter(isRelayableReply).length})`)
+  } catch (err) {
+    // No marker written — retried next start. Counter untouched.
+    logError(`Relay-filter counter migration skipped (${err.message}) — counter left at ${lastSentReplyCount}`)
+  }
+}
+
 async function saveLastSentCount(n) {
   await writeFile(LAST_SENT_FILE, String(n), 'utf-8')
 }
@@ -892,7 +929,7 @@ async function handleTextMessage(text, msg) {
   replyBaseline = lastSentReplyCount
   try {
     const dashUserInbox = await readJsonFile(join(TEAM_INBOXES_DIR, 'dashboard-user.json')) || []
-    const orchestratorReplies = dashUserInbox.filter(m => m.from === 'team-lead')
+    const orchestratorReplies = dashUserInbox.filter(isRelayableReply)
     if (msg && msg.message_id) {
       userMessageAnchors.push({
         inboxCountAtSend: orchestratorReplies.length,
@@ -1552,7 +1589,7 @@ async function checkForReplies() {
     await refreshActiveInbox()
 
     const dashUserInbox = await readJsonFile(join(TEAM_INBOXES_DIR, 'dashboard-user.json')) || []
-    const orchestratorReplies = dashUserInbox.filter(m => m.from === 'team-lead')
+    const orchestratorReplies = dashUserInbox.filter(isRelayableReply)
 
     // Safety: if the inbox was truncated/recreated (e.g. orchestrator restart),
     // our counter may be too high. Reset to 0 so all messages in the new inbox
@@ -1590,10 +1627,15 @@ async function checkForReplies() {
      let overflowOk = true // caption-overflow trailing text (image branch) delivered?
      let chosenAnchor = null // anchor this reply threads to; marked used on delivery
      try {
-      const text = reply.text || reply.content || ''
-      if (!text.trim()) {
+      const rawText = reply.text || reply.content || ''
+      // Everything downstream (image extraction, threading, truncation, edit-merge) operates
+      // on the LABELLED text, so a worker's message arrives attributed. The empty check and
+      // handleCanaryAck deliberately use the RAW text: a canary ack is matched by exact
+      // content, and a prefix would stop it matching and forward canary plumbing to Jeff.
+      const text = labelReplyText(reply.from, rawText)
+      if (!rawText.trim()) {
         delivered = true // nothing to send — count as handled
-      } else if (handleCanaryAck(text.trim())) {
+      } else if (handleCanaryAck(rawText.trim())) {
         delivered = true // canary plumbing — swallowed, never forwarded to Jeff
       } else {
 
@@ -2230,12 +2272,17 @@ async function main() {
   await refreshActiveInbox()
   log(`Active team inbox resolved: ${TEAM_INBOXES_DIR}`)
 
+  // Translate lastSentReplyCount out of the old team-lead-only index space BEFORE the
+  // truncation check below reads it — that check compares the counter against the WIDENED
+  // array, so running it against an untranslated counter would mis-detect truncation.
+  await migrateReplyCounterForWidenedFilter()
+
   // Startup counter sync check — detect if inbox was truncated since last run.
   // Reset to 0 (not current length) because a truncated inbox means a new
   // orchestrator session — all messages in it are new and need forwarding.
   try {
     const dashUserInbox = await readJsonFile(join(TEAM_INBOXES_DIR, 'dashboard-user.json')) || []
-    const orchestratorReplies = dashUserInbox.filter(m => m.from === 'team-lead')
+    const orchestratorReplies = dashUserInbox.filter(isRelayableReply)
     if (lastSentReplyCount > orchestratorReplies.length) {
       log(`Inbox truncated since last run: counter was ${lastSentReplyCount}, inbox now has ${orchestratorReplies.length} replies — resetting to 0`)
       lastSentReplyCount = 0
