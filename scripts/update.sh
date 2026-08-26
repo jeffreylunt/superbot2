@@ -1,5 +1,39 @@
 #!/bin/bash
 # superbot2 update — pull latest code and reinstall assets (lightweight, no backup)
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🔴 DO NOT RUN THIS AS OF 2026-08-26. IT WILL CAUSE TWO SILENT REGRESSIONS.
+#
+# This script cp's repo -> live. That is only safe while repo is AHEAD of live.
+# Right now TWO live files are AHEAD OF REPO, and this script would revert both
+# with no warning and no backup (see the "no backup" note above).
+#
+#   1) scripts/write-session.sh
+#      LIVE (2026-08-24, 85 lines) carries a session-filename COLLISION GUARD.
+#      REPO (2026-02-24, 75 lines) does not, and the guard exists nowhere in git.
+#      That guard was added after a REAL production data loss: two summaries
+#      written in the same second silently overwrote each other and one worker's
+#      evidence was lost. Running this reintroduces that bug.
+#
+#   2) templates/space-worker-prompt.md
+#      REPO hardcodes /Users/gkkirsch/.superbot2/... EIGHT TIMES. The template
+#      sed below rewrites the `~/.superbot2` token and is a NO-OP against an
+#      absolute path, so this would clobber the correct live copy with another
+#      user's home directory. LIVE has zero occurrences and is correct.
+#
+# Backport both into the repo first — tasks task-2026-08-26T06-30-09Z and
+# task-2026-08-26T06-30-25Z. Then delete this block.
+#
+# ⚠️ THE GENERAL HAZARD, WHICH OUTLIVES THOSE TWO FIXES: direction of truth is
+# NOT always repo->live. Live files get hand-patched during incidents and the
+# repo does not always catch up. Run scripts/check-repo-live-drift.sh BEFORE
+# this and read every DIFFERS line — a live-ahead file is a fix you are about
+# to destroy.
+#
+# ⚠️ Blast radius: sixteen scripts, from the WORKING TREE (so another agent's
+# uncommitted edits ship too), then a dashboard and agent restart. For a
+# one-file change, copy that one file and verify at the executing path instead.
+# ═══════════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
 SUPERBOT2_NAME="${SUPERBOT2_NAME:-superbot2}"
