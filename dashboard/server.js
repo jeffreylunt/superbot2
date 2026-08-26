@@ -8,6 +8,9 @@ import { randomUUID } from 'node:crypto'
 import yaml from 'js-yaml'
 import multer from 'multer'
 import { resolveActiveTeamInboxesDir as resolveActiveTeamInboxes } from './active-team-inbox.mjs'
+// Same rule the Telegram relay applies, imported rather than re-stated so the chat view and
+// Telegram cannot drift apart about which outbox entries are messages to Jeff.
+import { isRelayableReply } from '../scripts/relay-filter.mjs'
 
 const app = express()
 const PORT = parseInt(process.env.SUPERBOT2_API_PORT || '3274', 10)
@@ -5070,9 +5073,12 @@ app.get('/api/messages', async (req, res) => {
     // User messages sent from dashboard
     const userMessages = teamLeadInbox.filter(m => m.from === 'dashboard-user')
 
-    // Orchestrator replies to user
+    // Replies to the user. This used to be `from === 'team-lead'`, which meant a worker's
+    // message to dashboard-user was invisible HERE as well as on Telegram — the same entry
+    // dropped twice, so there was no surface on which it could be noticed. Shares the relay's
+    // rule so the chat view and Telegram cannot disagree about what Jeff was sent.
     const orchestratorReplies = dashUserInbox
-      .filter(m => m.from === 'team-lead')
+      .filter(isRelayableReply)
       .map(m => ({ ...m, to: 'dashboard-user' }))
 
     if (!includeBackground) {
