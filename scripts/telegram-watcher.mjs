@@ -1980,6 +1980,71 @@ async function pollUpdates() {
                 logError(`Failed to download document: ${dlErr.message}`)
                 await sendMessage(`Failed to download your file (${docName}).`)
               }
+            } else if (msg.voice) {
+              // Voice notes. Do NOT transcribe here — whisper takes 20-60s and this
+              // loop is single-threaded, which would stall the entire relay (including
+              // plain text messages) on every voice note. Relay the local file path
+              // and let the orchestrator transcribe out-of-band.
+              const voice = msg.voice
+              log(`Inbound voice message [update_id=${update.update_id}, msg_id=${msg.message_id}]: duration=${voice.duration}s, file_id=${voice.file_id}`)
+              try {
+                const localPath = await downloadTelegramFile(voice.file_id)
+                const caption = msg.caption || ''
+                const relayText = caption
+                  ? `${caption}\n\n[Voice message, ${voice.duration}s]\n${localPath}`
+                  : `[Voice message, ${voice.duration}s]\n${localPath}`
+                await handleTextMessage(relayText, msg)
+              } catch (dlErr) {
+                logError(`Failed to download voice message: ${dlErr.message}`)
+                await sendMessage('Failed to download your voice message.')
+              }
+            } else if (msg.audio) {
+              // Uploaded audio files (as opposed to recorded voice notes).
+              const audio = msg.audio
+              const label = audio.title
+                ? `${audio.title}${audio.performer ? ` — ${audio.performer}` : ''}`
+                : 'Audio file'
+              log(`Inbound audio [update_id=${update.update_id}, msg_id=${msg.message_id}]: ${label}, duration=${audio.duration}s, file_id=${audio.file_id}`)
+              try {
+                const localPath = await downloadTelegramFile(audio.file_id)
+                const caption = msg.caption || ''
+                const relayText = caption
+                  ? `${caption}\n\n[Audio: ${label}, ${audio.duration}s]\n${localPath}`
+                  : `[Audio: ${label}, ${audio.duration}s]\n${localPath}`
+                await handleTextMessage(relayText, msg)
+              } catch (dlErr) {
+                logError(`Failed to download audio: ${dlErr.message}`)
+                await sendMessage('Failed to download your audio file.')
+              }
+            } else {
+              // Catch-all: anything Telegram sends that has no specific handler above
+              // (video, video_note, sticker, location, contact, poll, animation, venue,
+              // dice, etc.). Without this branch the update was silently consumed —
+              // the offset still advances below — and the message was gone forever with
+              // no log line and no user-visible sign anything went wrong. That is worse
+              // than an error: startTyping() above already told the user "received,
+              // working on it" for a message that was about to be thrown away.
+              // See knowledge/telegram-message-recovery.md for how costly a silent
+              // inbound loss is to detect after the fact.
+              const KNOWN_METADATA_KEYS = new Set([
+                'message_id', 'from', 'chat', 'date', 'message_thread_id',
+                'reply_to_message', 'entities', 'caption_entities', 'caption',
+              ])
+              const unknownKeys = Object.keys(msg).filter(k => !KNOWN_METADATA_KEYS.has(k))
+              log(`Inbound UNHANDLED message type [update_id=${update.update_id}, msg_id=${msg.message_id}]: keys=${unknownKeys.join(', ') || '(none)'}`)
+              try {
+                await sendMessage(
+                  `I received your message but don't have a handler for this type yet (${unknownKeys.join(', ') || 'unknown'}). ` +
+                  'It was NOT processed or saved — please resend as text if it was important.',
+                  { replyToMessageId: msg.message_id }
+                )
+              } catch (notifyErr) {
+                logError(`Failed to notify user of unhandled message type: ${notifyErr.message}`)
+              }
+              // No relay to the orchestrator happened, so nothing will ever call
+              // stopTyping() for this update — stop it here or the typing indicator
+              // sticks until an unrelated orchestrator reply happens to clear it.
+              stopTyping()
             }
           }
         } catch (updateErr) {
