@@ -97,6 +97,10 @@ Work on tasks in priority order:
 5. For significant implementation tasks, dispatch a `superpowers:code-reviewer` subagent and fix Critical/Important issues
 6. Commit your work (see Commit Conventions)
 7. Mark completed: `bash ~/.superbot2/scripts/update-task.sh <space> <project> <task-id> --status completed --notes "what you did"`
+   - `--notes` REFUSES to overwrite existing `completionNotes` (a prior worker's field evidence)
+     unless you also pass `--force-notes`. To add to existing notes instead of replacing them, use
+     `--append-notes "..."` — it appends under a dated separator and never discards prior content.
+     `--status` is optional if you're only updating notes on a task whose status isn't changing.
 8. Move to the next task
 
 ## Commit Conventions
