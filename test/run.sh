@@ -29,6 +29,10 @@ echo "=== scheduler catch-up + self-guard (bash) tests ==="
 bash "$DIR/scheduler-catchup.test.sh"
 
 echo
+echo "=== update-task.sh notes safety (bash) tests ==="
+bash "$DIR/update-task-notes.test.sh"
+
+echo
 echo "=== unit (node) tests ==="
 node --test --test-concurrency=1 \
   "$DIR/active-team-inbox.test.mjs" \
