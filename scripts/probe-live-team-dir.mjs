@@ -21,6 +21,7 @@ import {
   resolveActiveTeamInboxesDir,
   LIVE_TEAM_PROC_START_ENV,
   procStartResolverEnabled,
+  ORCH_COMMAND_RE,
 } from '../dashboard/active-team-inbox.mjs'
 
 const pexecFile = promisify(execFile)
@@ -34,10 +35,13 @@ console.log('teams dir           ', TEAMS_DIR)
 console.log('orchestrator start  ', procStart ? new Date(procStart).toISOString() : 'NOT RUNNING')
 try {
   const { stdout } = await pexecFile('ps', ['-axo', 'pid=,etime=,command='], { maxBuffer: 64 * 1024 * 1024 })
+  // IMPORT the matcher, never re-declare it here. A probe carrying its own copy drifts from
+  // the module and then reports agreement while the module disagrees — which is the exact
+  // failure a probe exists to prevent. (This copy was already stale once: it kept the
+  // UNANCHORED pattern after the module moved to the anchored one.)
   for (const l of stdout.split('\n')) {
-    if (/claude --system-prompt( # Superbot2 Orchestrator|-file .*\.orchestrator-system-prompt)/.test(l)) {
-      console.log('orchestrator argv   ', l.trim().slice(0, 120))
-    }
+    const m = /^\s*(\d+)\s+(\S+)\s+(.*)$/.exec(l)
+    if (m && ORCH_COMMAND_RE.test(m[3])) console.log('orchestrator argv   ', l.trim().slice(0, 120))
   }
 } catch { /* best effort */ }
 
@@ -53,9 +57,13 @@ console.log('resolveActiveTeamInboxesDir, flag OFF         ', rel(off))
 console.log('resolveActiveTeamInboxesDir, flag ON          ', rel(on))
 console.log('flag in THIS process                          ', procStartResolverEnabled() ? 'ON' : 'OFF')
 
-// Independent witness: the team config that most recently gained a member. The harness
-// rewrites config.json on every agent spawn, so the live team's config mtime moves and no
-// dead team's does. This is a DIFFERENT signal from both createdAt and inbox freshness.
+// PARTIALLY independent witness: the most recently WRITTEN config.json. The harness rewrites
+// it on every agent spawn, so the live team's mtime moves and a dead team's never does.
+// ⚠️ Be precise about how independent this is: it is the mtime of the SAME FILE the resolver
+// reads createdAt out of. It is independent of inbox freshness and of createdAt's VALUE, but
+// it is not a wholly separate source. The genuinely independent check is the members list —
+// a live team contains agents spawned today. Note agent NAMES are recycled across sessions,
+// so only date-stamped names are usable as evidence.
 let witness = null
 for (const name of await readdir(TEAMS_DIR).catch(() => [])) {
   const cfgPath = join(TEAMS_DIR, name, 'config.json')
@@ -69,7 +77,7 @@ for (const name of await readdir(TEAMS_DIR).catch(() => [])) {
   } catch { /* not a registered team */ }
 }
 console.log()
-console.log('independent witness (newest config.json write)', witness ? `${basename(witness.dir)} (members=${witness.members}, ${new Date(witness.mtimeMs).toISOString()})` : 'none')
+console.log('witness (newest config.json write, partially independent)', witness ? `${basename(witness.dir)} (members=${witness.members}, ${new Date(witness.mtimeMs).toISOString()})` : 'none')
 
 console.log()
 if (!procStart) {
@@ -85,3 +93,42 @@ if (!procStart) {
   console.log('   proc-start:', rel(byProc), ' witness:', witness ? basename(witness.dir) : 'none')
   console.log('   DO NOT enable the flag until this is understood.')
 }
+
+// ---------------------------------------------------------------------------
+// STRANDED USER MESSAGES — the one signal that survives when every resolver is wrong
+//
+// Costs one directory walk. An unread message whose `from` is dashboard-user is a USER
+// message nobody answered, wherever it physically sits. It does not depend on knowing which
+// team is live, which is exactly why it still works when the resolvers disagree.
+//
+// `migrationHops >= 1` AND still unread is a SELF-DECLARING FAILURE: the stranded-inbox
+// migration already rescued that message once and delivered it into another dead inbox, then
+// recorded the job as done. Nothing in the codebase currently reads that counter.
+console.log()
+console.log('--- unread dashboard-user messages across ALL team inboxes ---')
+let stranded = 0
+for (const name of await readdir(TEAMS_DIR).catch(() => [])) {
+  for (const box of ['team-lead.json', 'dashboard-user.json']) {
+    const p = join(TEAMS_DIR, name, 'inboxes', box)
+    let entries
+    try {
+      const st = await lstat(p)
+      if (st.isSymbolicLink() || !st.isFile()) continue
+      entries = JSON.parse(await readFile(p, 'utf-8'))
+    } catch { continue }
+    if (!Array.isArray(entries)) continue
+    for (const m of entries) {
+      if (m?.from !== 'dashboard-user' || m?.read) continue
+      stranded++
+      const hops = m.migrationHops ?? 0
+      console.log(`  ${name}/${box}`)
+      console.log(`    from=${m.from} timestamp=${m.timestamp} read=${m.read}`)
+      if (hops) {
+        console.log(`    🔴 migrationHops=${hops} migratedFrom=${m.migratedFrom} originalTimestamp=${m.originalTimestamp}`)
+        console.log('       ^ already rescued once and delivered into another dead inbox')
+      }
+      console.log(`    text: ${String(m.text ?? '').replace(/\s+/g, ' ').slice(0, 110)}`)
+    }
+  }
+}
+console.log(stranded === 0 ? '  none' : `  ${stranded} unread user message(s) stranded`)

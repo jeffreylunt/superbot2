@@ -38,7 +38,7 @@ const ORCH_ARGV_RE = /claude --system-prompt( # Superbot2 Orchestrator|-file .*\
 // the resolver would be silently inert for as long as such a process existed. Anchoring at
 // the start of the command kills the whole class. The optional path prefix keeps a
 // `/usr/local/bin/claude …` launch working.
-const ORCH_COMMAND_RE = /^(?:\S*\/)?claude --system-prompt( # Superbot2 Orchestrator|-file .*\.orchestrator-system-prompt)/
+export const ORCH_COMMAND_RE = /^(?:\S*\/)?claude --system-prompt( # Superbot2 Orchestrator|-file .*\.orchestrator-system-prompt)/
 
 // ============================================================================
 // SESSION IDENTITY: why the transcript-filename derivation below can never work
@@ -111,7 +111,6 @@ export function parseEtimeMs(etime) {
 // `psRunner` / `nowMs` exist purely as an injection seam: without them this function cannot
 // be tested except against a live orchestrator, which is why the original shipped untested.
 export async function orchestratorProcStartMs({ psRunner = null, nowMs = null } = {}) {
-  const now = nowMs ?? Date.now()
   let stdout
   try {
     stdout = psRunner
@@ -120,6 +119,9 @@ export async function orchestratorProcStartMs({ psRunner = null, nowMs = null } 
   } catch {
     return null
   }
+  // Capture `now` AFTER the ps call: etime is sampled by ps, so a pre-call timestamp biases
+  // the computed start EARLIER (the permissive direction). Negligible vs 120s, but free.
+  const now = nowMs ?? Date.now()
   let newest = null
   for (const line of String(stdout).split('\n')) {
     const m = /^\s*(\d+)\s+(\S+)\s+(.*)$/.exec(line)
@@ -141,14 +143,34 @@ export async function orchestratorProcStartMs({ psRunner = null, nowMs = null } 
 // dead one is hours-to-months, so this bound is not load-bearing at its exact value.
 export const LIVE_TEAM_PROC_START_TOLERANCE_MS = 120_000
 
+// Upper bound. A team created BY a running process cannot have been created in the future,
+// so anything beyond now+skew is impossible and must be rejected.
+//
+// 🔴 WHY THIS EXISTS (code review, 2026-08-28). Without it the predicate was unbounded above
+// AND used `typeof === 'number'`, which ADMITS Infinity: JSON.parse('{"createdAt":1e999}')
+// yields Infinity, typeof 'number', and `Infinity >= procStart - 120s` is true FOREVER — across
+// every restart. Since the other three clauses are satisfied by construction by any
+// harness-written config, one poisoned dir becomes a permanent candidate. It bites hardest in
+// the window the docstring promises is safe (team-not-created-yet), where the real team is
+// absent and the poisoned dir is therefore the SOLE candidate, so candidates.length === 1
+// returns it and pins BOTH directions to a dead dir. Reachable by clock skew, an NTP step
+// after sleep/wake, a config restored from backup, or a hand edit.
+//
+// "No upper bound is deliberate" justifies createdAt >> procStart (a session may create its
+// team late). It does NOT justify createdAt >> now. That bound is free.
+export const LIVE_TEAM_MAX_FUTURE_MS = 120_000
+
 // GROUND TRUTH: the live orchestrator's team dir, resolved by correlating team
 // config.createdAt with the running orchestrator's process start. Returns null when the
 // orchestrator is down, when no team qualifies (the genuine team-not-created-yet window),
 // or when the answer is AMBIGUOUS — in every one of those cases the caller falls back to
 // freshness scoring. Returning null is always safe; returning a wrong dir is not.
+// Memo for the log-on-change above; declared before its user to avoid a TDZ-shaped trap.
+let lastAcceptedTeamDir
 export async function liveOrchestratorTeamDirByProcStart(teamsDir, { psRunner = null, nowMs = null } = {}) {
   const procStart = await orchestratorProcStartMs({ psRunner, nowMs })
   if (procStart === null) return null // orchestrator not running
+  const now = nowMs ?? Date.now()
 
   let entries = []
   try {
@@ -160,9 +182,13 @@ export async function liveOrchestratorTeamDirByProcStart(teamsDir, { psRunner = 
   const candidates = []
   for (const name of entries) {
     const teamDir = join(teamsDir, name)
+    const cfgPath = join(teamDir, 'config.json')
+    // A SYMLINKED config.json must not qualify a team as live — same stance the freshness
+    // scorer takes, for the same band-aid-symlink reason.
+    if ((await realFileMtimeMs(cfgPath)) === null) continue
     let cfg
     try {
-      cfg = JSON.parse(await readFile(join(teamDir, 'config.json'), 'utf-8'))
+      cfg = JSON.parse(await readFile(cfgPath, 'utf-8'))
     } catch {
       continue // not a registered team (or unreadable/corrupt config)
     }
@@ -187,7 +213,9 @@ export async function liveOrchestratorTeamDirByProcStart(teamsDir, { psRunner = 
     // process start" is n=1 — an observation, never relied on as a bound.
     if (cfg.name !== basename(teamDir)) continue
     if (cfg.leadAgentId !== 'team-lead@' + cfg.name) continue
-    if (typeof cfg.createdAt !== 'number') continue
+    // Number.isFinite, NOT typeof: rejects Infinity and NaN. See LIVE_TEAM_MAX_FUTURE_MS.
+    if (!Number.isFinite(cfg.createdAt)) continue
+    if (cfg.createdAt > now + LIVE_TEAM_MAX_FUTURE_MS) continue // physically impossible
     // No UPPER bound is applied, deliberately: a session may not create its team until it
     // first uses teams, so "createdAt is much later than process start" is legitimate. It is
     // safe because we correlate against the NEWEST running orchestrator — nothing else on
@@ -197,16 +225,36 @@ export async function liveOrchestratorTeamDirByProcStart(teamsDir, { psRunner = 
   }
 
   // Exactly one, or nothing. An ambiguous answer must never be guessed — see the risk note.
-  return candidates.length === 1 ? candidates[0] : null
+  const accepted = candidates.length === 1 ? candidates[0] : null
+  // The governing risk is that a wrong pin is "invisible from inside the system". Log the
+  // acceptance ON CHANGE (not every call — this runs on a poll loop) so the canary is
+  // readable from OUTSIDE, in each of the four consumer processes' logs.
+  if (accepted !== lastAcceptedTeamDir) {
+    lastAcceptedTeamDir = accepted
+    console.error(`[active-team-inbox] proc-start resolver -> ${accepted ?? 'null (falling back to freshness scoring)'}`)
+  }
+  return accepted
 }
 
-// LEGACY, INERT: kept only so the regression test can assert that the proc-start resolver
-// does NOT agree with it on a fixture where the two id spaces differ. Do not call this for
-// routing. See the "SESSION IDENTITY" block above for the measurement.
-export async function liveOrchestratorTeamDirByTranscript(teamsDir) {
+// ⚠️ THIS IS THE SHIPPED DEFAULT while SUPERBOT2_LIVE_TEAM_BY_PROC_START is off — it is the
+// code path governing PRODUCTION routing right now, for every consumer. It is also known to
+// return null in practice on every boot (0 of 12 team dirs match; see the SESSION IDENTITY
+// block), which is why the system runs entirely on freshness scoring. Both things are true at
+// once. DO NOT DELETE IT as dead code until the flag is on in every consumer process.
+export async function liveOrchestratorTeamDirByTranscript(teamsDir, { psRunner = null } = {}) {
   try {
-    const { stdout } = await pexecFile('ps', ['-axo', 'command='], { maxBuffer: 64 * 1024 * 1024 })
-    if (!stdout.split('\n').some((l) => ORCH_ARGV_RE.test(l))) return null
+    // psRunner seam added 2026-08-28: without it this path silently shells out to the HOST's
+    // real ps even from inside an isolated test home, so a test exercising the flag-OFF branch
+    // passed for a DIFFERENT reason depending on whether the dev machine had an orchestrator
+    // running. Anchored match for the same self-match reason as ORCH_COMMAND_RE.
+    const stdout = psRunner
+      ? await psRunner()
+      : (await pexecFile('ps', ['-axo', 'pid=,etime=,command='], { maxBuffer: 64 * 1024 * 1024 })).stdout
+    const alive = String(stdout).split('\n').some((l) => {
+      const m = /^\s*(\d+)\s+(\S+)\s+(.*)$/.exec(l)
+      return m ? ORCH_COMMAND_RE.test(m[3]) : false
+    })
+    if (!alive) return null
   } catch {
     return null
   }
@@ -246,8 +294,9 @@ export async function liveOrchestratorTeamDirByTranscript(teamsDir) {
 // for one canary cycle, confirm a MATCHED canary ack, then change this default.
 export const LIVE_TEAM_PROC_START_ENV = 'SUPERBOT2_LIVE_TEAM_BY_PROC_START'
 
-export function procStartResolverEnabled(env = process.env) {
-  const v = env?.[LIVE_TEAM_PROC_START_ENV]
+export function procStartResolverEnabled(env) {
+  // `??` not a default param: a caller passing null must still fall through to process.env.
+  const v = (env ?? process.env)?.[LIVE_TEAM_PROC_START_ENV]
   return v === '1' || v === 'true' || v === 'yes'
 }
 
@@ -256,7 +305,7 @@ export async function liveOrchestratorTeamDir(teamsDir, { env, psRunner = null, 
   if (procStartResolverEnabled(env)) {
     return liveOrchestratorTeamDirByProcStart(teamsDir, { psRunner, nowMs })
   }
-  return liveOrchestratorTeamDirByTranscript(teamsDir)
+  return liveOrchestratorTeamDirByTranscript(teamsDir, { psRunner })
 }
 
 // mtime (ms) of a REAL (non-symlink) file, else null.

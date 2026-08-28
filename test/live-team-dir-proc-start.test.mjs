@@ -18,13 +18,14 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, utimesSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, utimesSync, symlinkSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   parseEtimeMs,
   orchestratorProcStartMs,
   liveOrchestratorTeamDirByProcStart,
+  liveOrchestratorTeamDirByTranscript,
   liveOrchestratorTeamDir,
   resolveActiveTeamInboxesDir,
   procStartResolverEnabled,
@@ -179,13 +180,102 @@ test('MUTATION CHECK: resolves the live team, NOT the team the transcript filena
 
 // --- THE SIDE-BY-SIDE FAILING CASE -------------------------------------------
 
-test('CONTROL: flag OFF resolves to the STALE team; flag ON resolves to the LIVE team', async () => {
+// The OFF branch must be driven by the INJECTED ps, never the host's. Before the seam was
+// threaded into the transcript resolver, these two cases collapsed into one assertion that
+// passed via the TRANSCRIPT path on a machine with a live orchestrator and via the FRESHNESS
+// path on one without — same result, different mechanism, selected by the host. A control
+// that cannot say which mechanism produced its result is not a control.
+
+test('CONTROL A (orchestrator RUNNING): flag OFF -> STALE via the transcript path; flag ON -> LIVE', async () => {
   const { teamsDir, stale, live } = fixture()
+  // Prove the mechanism, not just the destination: with a live orchestrator the legacy
+  // resolver positively RESOLVES the transcript-named dir (it exists in this fixture).
+  assert.equal(await liveOrchestratorTeamDirByTranscript(teamsDir, { psRunner: seam.psRunner }),
+    stale.teamDir, 'legacy resolver must pick the transcript-named team here')
   const off = await resolveActiveTeamInboxesDir(teamsDir, { ...seam, env: OFF })
   const on = await resolveActiveTeamInboxesDir(teamsDir, { ...seam, env: ON })
-  assert.equal(off, stale.inboxes, 'shipped default reproduces the bug on this fixture')
-  assert.equal(on, live.inboxes, 'proc-start resolver routes to the live orchestrator')
+  assert.equal(off, stale.inboxes)
+  assert.equal(on, live.inboxes)
   assert.notEqual(off, on, 'the two must differ, or this fixture proves nothing')
+})
+
+test('CONTROL B (orchestrator ABSENT): flag OFF -> STALE via freshness; flag ON -> null-safe fallback', async () => {
+  const { teamsDir, stale } = fixture()
+  const noOrch = { psRunner: fakePs(), nowMs: NOW }
+  assert.equal(await liveOrchestratorTeamDirByTranscript(teamsDir, noOrch), null,
+    'legacy resolver must decline when no orchestrator is running')
+  // Both flags now fall through to freshness, which picks the stale team (it is freshest).
+  assert.equal(await resolveActiveTeamInboxesDir(teamsDir, { ...noOrch, env: OFF }), stale.inboxes)
+  assert.equal(await resolveActiveTeamInboxesDir(teamsDir, { ...noOrch, env: ON }), stale.inboxes)
+})
+
+test('flag OFF returns NULL on a fixture shaped like the real machine', async () => {
+  // On the live system no session-<transcript8> dir exists, so the legacy resolver returns
+  // null. The other CONTROL fixtures deliberately DO create that dir, so nothing there
+  // asserts the null. Assert it explicitly.
+  const { teamsDir, stale } = fixture()
+  rmSync(stale.teamDir, { recursive: true, force: true })
+  assert.equal(await liveOrchestratorTeamDir(teamsDir, { ...seam, env: OFF }), null)
+})
+
+// --- C1: a poisoned createdAt must never become a permanent candidate -------------
+
+test('C1: Infinity createdAt is rejected (typeof would admit it)', async () => {
+  // JSON.parse('{"createdAt":1e999}') yields Infinity, typeof 'number'. Under the original
+  // predicate it satisfied `>= procStart - 120s` FOREVER, across every restart, and would be
+  // the SOLE candidate during the team-not-created-yet window -> pins both directions.
+  const { teamsDir, live } = fixture()
+  assert.equal(JSON.parse('{"createdAt":1e999}').createdAt, Infinity) // the actual mechanism
+  writeFileSync(live.cfgPath, '{"name":"session-bbbbbbbb","createdAt":1e999,"leadAgentId":"team-lead@session-bbbbbbbb","members":[]}')
+  assert.equal(await liveOrchestratorTeamDirByProcStart(teamsDir, seam), null)
+})
+
+test('C1: a createdAt in the future is rejected as physically impossible', async () => {
+  const { teamsDir, live } = fixture()
+  writeFileSync(live.cfgPath, JSON.stringify({
+    name: 'session-bbbbbbbb', createdAt: NOW + 10 * 365 * 86_400_000,
+    leadAgentId: 'team-lead@session-bbbbbbbb', members: [],
+  }))
+  assert.equal(await liveOrchestratorTeamDirByProcStart(teamsDir, seam), null)
+})
+
+test('C1: a NaN createdAt is rejected', async () => {
+  const { teamsDir, live } = fixture()
+  writeFileSync(live.cfgPath, '{"name":"session-bbbbbbbb","createdAt":null,"leadAgentId":"team-lead@session-bbbbbbbb"}')
+  assert.equal(await liveOrchestratorTeamDirByProcStart(teamsDir, seam), null)
+})
+
+test('a SYMLINKED config.json does not qualify a team as live', async () => {
+  const { teamsDir, live, stale } = fixture()
+  rmSync(live.cfgPath)
+  symlinkSync(join(stale.teamDir, 'config.json'), live.cfgPath)
+  assert.equal(await liveOrchestratorTeamDirByProcStart(teamsDir, seam), null)
+})
+
+// --- the MIGRATION DESTINATION, not just live delivery -----------------------
+
+test('MIGRATION DESTINATION: flag ON stops the replay laundering a message into a dead inbox', async () => {
+  // Live forensics 2026-08-28: a dashboard-user message in session-c35d3fc3 carries
+  // migratedFrom: session-6db72288 / migrationHops: 1 — the stranded-inbox migration already
+  // rescued it ONCE and delivered it into a SECOND dead inbox, where it sat unread for 25
+  // days while the job recorded itself as done.
+  //
+  // "Resolve the live inbox" and "choose a replay destination" are different questions, and
+  // inbox-migration.mjs answers the second with scoreLeadInbox:false because counting
+  // team-lead.json mtime there is CIRCULAR — a dead team keeps looking fresh precisely
+  // because of the misdelivered messages we are trying to move out of it.
+  //
+  // The point of this test: stage one runs BEFORE any scoring, so when it resolves, the
+  // circularity is not mitigated, it is STRUCTURALLY ABSENT — scoreLeadInbox stops mattering.
+  const { teamsDir, stale, live } = fixture()
+  const opts = { ...seam, scoreLeadInbox: false } // exactly how inbox-migration.mjs calls it
+  const off = await resolveActiveTeamInboxesDir(teamsDir, { ...opts, env: OFF })
+  const on = await resolveActiveTeamInboxesDir(teamsDir, { ...opts, env: ON })
+  assert.equal(off, stale.inboxes, 'today the replay destination IS the dead team')
+  assert.equal(on, live.inboxes, 'proc-start resolver sends the replay to the live orchestrator')
+  // And it is immune to the scoring flag either way, because scoring never runs.
+  assert.equal(await resolveActiveTeamInboxesDir(teamsDir, { ...seam, scoreLeadInbox: true, env: ON }),
+    live.inboxes, 'stage one bypasses scoring, so scoreLeadInbox cannot change the answer')
 })
 
 // --- safety: null rather than a wrong answer ---------------------------------
