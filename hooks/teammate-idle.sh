@@ -153,7 +153,16 @@ if [[ -n "$RECENT_FILE" && -f "$RECENT_FILE" ]]; then
   fi
 
   # --- Check 5: Verified work ---
-  if ! grep -qE 'npm test|npm run|npx |pytest|cargo test|go test|make test|verification-before-completion|curl |open http' "$RECENT_FILE" 2>/dev/null; then
+  # WIDENED 2026-08-27, additively — every pre-existing alternative is retained verbatim.
+  # The old pattern matched none of the forms this repo's own suite is actually run with, so
+  # a worker who ran the full suite was told it had not verified its work, while a stray
+  # `curl ` anywhere in the transcript satisfied the check. Added: the bash/node runners
+  # (`bash test/run.sh`, any `*.test.sh`, `node --test`) and, best of all, `SUITE RESULT:` —
+  # the verdict line test/run.sh always prints last. That last one is the only alternative
+  # here that is evidence the suite actually RAN; all the others match a command SHAPE and
+  # can be satisfied by a command that failed. Widen this pattern, never narrow it: a
+  # false negative here nags every worker in every space.
+  if ! grep -qE 'npm test|npm run|npx |pytest|cargo test|go test|make test|bash test/run\.sh|test/run\.sh|\.test\.sh|node --test|SUITE RESULT|verification-before-completion|curl |open http' "$RECENT_FILE" 2>/dev/null; then
     MISSING+=("Verify your work. Run tests, build commands, or use the verification-before-completion skill to confirm your changes work correctly.")
   fi
 
