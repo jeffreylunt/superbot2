@@ -30,6 +30,15 @@ const pexecFile = promisify(execFile)
 // Both argv generations are matched: the legacy inline prompt, and the 2026-08-10
 // --system-prompt-file form (see ORCH_PATTERN in orchestrator-watchdog.sh).
 const ORCH_ARGV_RE = /claude --system-prompt( # Superbot2 Orchestrator|-file .*\.orchestrator-system-prompt)/
+// ANCHORED form, used when we have the command field isolated from ps. ORCH_ARGV_RE is
+// unanchored and therefore matches ANY process whose argv merely CONTAINS the pattern —
+// observed live 2026-08-28: two `node -e "...ORCH_ARGV_RE source text..."` scanners matched
+// themselves and appeared as orchestrators with etime 00:00. Newest-wins would then take
+// `now` as the process start and nothing would qualify (fail-safe → null → freshness), but
+// the resolver would be silently inert for as long as such a process existed. Anchoring at
+// the start of the command kills the whole class. The optional path prefix keeps a
+// `/usr/local/bin/claude …` launch working.
+const ORCH_COMMAND_RE = /^(?:\S*\/)?claude --system-prompt( # Superbot2 Orchestrator|-file .*\.orchestrator-system-prompt)/
 
 // ============================================================================
 // SESSION IDENTITY: why the transcript-filename derivation below can never work
@@ -113,9 +122,10 @@ export async function orchestratorProcStartMs({ psRunner = null, nowMs = null } 
   }
   let newest = null
   for (const line of String(stdout).split('\n')) {
-    if (!ORCH_ARGV_RE.test(line)) continue
     const m = /^\s*(\d+)\s+(\S+)\s+(.*)$/.exec(line)
     if (!m) continue
+    if (!ORCH_COMMAND_RE.test(m[3])) continue // anchored: see ORCH_COMMAND_RE
+    if (Number(m[1]) === process.pid) continue // never count the scanner itself
     const elapsed = parseEtimeMs(m[2])
     if (elapsed === null) continue
     const startMs = now - elapsed
@@ -157,11 +167,24 @@ export async function liveOrchestratorTeamDirByProcStart(teamsDir, { psRunner = 
       continue // not a registered team (or unreadable/corrupt config)
     }
     if (!cfg || typeof cfg !== 'object') continue
-    // Every clause must hold. These are INDEPENDENT signals, not restatements of one:
-    // - name/basename agreement rejects a config.json symlinked in from another team
-    //   (the band-aid-symlink failure mode this module already guards against elsewhere).
-    // - leadAgentId ties the dir to its own lead, so a hand-copied config cannot qualify.
-    // - createdAt vs process start is what actually separates live from dead.
+    // ⚠️ BE HONEST ABOUT WHAT THESE ARE. There is exactly ONE discriminating signal here —
+    // time — plus three WELL-FORMEDNESS guards. Do not read the list as four independent
+    // witnesses; it is one witness with three sanity checks:
+    //   (a) name === basename   well-formedness: rejects a config.json symlinked/copied in
+    //                           from another team (the band-aid-symlink failure mode).
+    //   (b) leadAgentId         well-formedness: derived FROM cfg.name, so it is not
+    //                           independent of (a) — it only rejects a malformed or
+    //                           hand-written config that does not follow the convention.
+    //   (c) typeof createdAt    a type guard, not an identity signal at all.
+    //   (d) createdAt vs procStart   THE discriminator. Everything rests on this.
+    // What compensates for resting on a single signal is the null-on-ambiguity rule below,
+    // not the length of this list.
+    //
+    // The band is [procStart - 120s, ∞). Measured 2026-08-28 across all 12 team dirs: the
+    // live team sits at +0.0h and the NEAREST dead team at -35.08h, so the 120s slack would
+    // have to grow ~1000x before it changed any verdict. The slack is for clock granularity,
+    // it is NOT a tuned threshold, and the frequently-quoted "createdAt lands 0.6-1.5s after
+    // process start" is n=1 — an observation, never relied on as a bound.
     if (cfg.name !== basename(teamDir)) continue
     if (cfg.leadAgentId !== 'team-lead@' + cfg.name) continue
     if (typeof cfg.createdAt !== 'number') continue

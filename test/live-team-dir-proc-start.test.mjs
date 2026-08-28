@@ -137,6 +137,34 @@ test('orchestratorProcStartMs returns null when ps itself fails', async () => {
   assert.equal(await orchestratorProcStartMs({ psRunner, nowMs: NOW }), null)
 })
 
+test('SELF-MATCH: a scanner whose own argv contains the pattern is NOT counted', async () => {
+  // Observed live 2026-08-28: `node -e "<source containing the orch regex>"` processes showed
+  // up as orchestrators with etime 00:00. Newest-wins would take `now` as the process start,
+  // nothing would qualify, and the resolver would go silently inert. The command match is
+  // anchored to the START of the command field, so these cannot match.
+  const impostor = `  99999 00:00 node -e import('./x.mjs').then(m=>/claude --system-prompt-file .*\\.orchestrator-system-prompt/.test(l))`
+  const psRunner = async () => [impostor, psLine(13013, ETIME), ''].join('\n')
+  assert.equal(await orchestratorProcStartMs({ psRunner, nowMs: NOW }), PROC_START,
+    'the impostor must not become the newest orchestrator')
+})
+
+test('an orchestrator launched by ABSOLUTE PATH is still counted', async () => {
+  const abs = `  13013 ${ETIME} /usr/local/bin/claude --system-prompt-file /Users/jeff/.superbot2/.orchestrator-system-prompt.md --model opus`
+  const psRunner = async () => [abs, ''].join('\n')
+  assert.equal(await orchestratorProcStartMs({ psRunner, nowMs: NOW }), PROC_START)
+})
+
+test('a DD- etime is never silently truncated to HH:MM:SS', async () => {
+  // The real orchestrator is currently 2d20h old and reads "02-20:44:09". A parser written
+  // against HH:MM:SS would drop the day field and compute a start ~68 HOURS late — which
+  // would drag the apparent process start forward into the range of recent DEAD teams and
+  // could make one of them qualify. It fails in the direction that matters.
+  assert.equal(parseEtimeMs('02-20:44:09'), 247_449_000)
+  const wrong = parseEtimeMs('20:44:09')
+  assert.notEqual(parseEtimeMs('02-20:44:09'), wrong, 'day field must change the result')
+  assert.equal(parseEtimeMs('02-20:44:09') - wrong, 2 * 86_400_000, 'exactly two days apart')
+})
+
 // --- THE MUTATION CHECK ------------------------------------------------------
 
 test('MUTATION CHECK: resolves the live team, NOT the team the transcript filename names', async () => {
