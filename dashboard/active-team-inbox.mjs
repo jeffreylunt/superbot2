@@ -10,7 +10,7 @@
 // misdelivered inbound has none) and is most recently active.
 
 import { readdir, lstat, readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { join, basename } from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 
@@ -24,24 +24,142 @@ const pexecFile = promisify(execFile)
 // appears. Proven live 4x (2026-07-13..16): Jeff's messages orphaned in a dead team
 // while the live orchestrator reported "Idle — nothing to process".
 //
-// Ground truth is the RUNNING orchestrator process: its argv carries --session-id, and
-// its team dir (when it exists) is `session-<uuid8>` with config.leadSessionId matching
-// the full uuid. If that team dir exists, it IS the active team — no scoring needed.
-// If the process is down or its team dir doesn't exist yet, return null and let the
-// caller fall back to freshness scoring (a mailbox is better than nowhere; the stranded-
-// inbox migration replays once the live team materializes and this preference kicks in).
-//
-// Liveness: ps -axo + string match on the argv HEAD (survives macOS's argv truncation;
-// pgrep -f never matches ANCESTORS of the caller — same caveats as
-// migrate-stranded-inbox.mjs). Session identity: the argv TAIL (--session-id) gets
-// truncated away by ps, so it is NOT recoverable there — instead use the freshest
-// top-level transcript jsonl in the orchestrator config-dir's projects dir, whose
-// FILENAME is the session uuid (the same source wake-nudge trusts for turn activity;
-// the live session writes its transcript immediately at boot).
-// Both argv generations: legacy inline prompt, and the 2026-08-10 --system-prompt-file
-// form (see ORCH_PATTERN in orchestrator-watchdog.sh).
+// Ground truth is the RUNNING orchestrator process. Liveness comes from its argv
+// (ps -axo + string match on the argv HEAD; survives macOS argv truncation, and pgrep -f
+// never matches ANCESTORS of the caller — same caveat as migrate-stranded-inbox.mjs).
+// Both argv generations are matched: the legacy inline prompt, and the 2026-08-10
+// --system-prompt-file form (see ORCH_PATTERN in orchestrator-watchdog.sh).
 const ORCH_ARGV_RE = /claude --system-prompt( # Superbot2 Orchestrator|-file .*\.orchestrator-system-prompt)/
-export async function liveOrchestratorTeamDir(teamsDir) {
+
+// ============================================================================
+// SESSION IDENTITY: why the transcript-filename derivation below can never work
+// ============================================================================
+// The original implementation derived the team dir from the freshest top-level transcript
+// .jsonl FILENAME, which is the CLI --session-id. That is a DIFFERENT ID SPACE from the one
+// the team dir is named after. Measured 2026-08-02 (1 of 9 matched), re-measured 2026-08-26
+// (0 of 11) and again 2026-08-28 (0 of 12 — every team dir, no exceptions):
+//
+//   orchestrator argv          --session-id 1ae1f671-4cc1-4499-b92a-de5653652c0a
+//   ~/.superbot2/.orchestrator-session      1ae1f671-…            (same)
+//   freshest transcript        1ae1f671-….jsonl                   (same)
+//   live team dir              session-58a99d14
+//     config.leadSessionId     58a99d14-5984-4fa6-a831-b6ecd471b69f   <- appears NOWHERE else
+//
+// 58a99d14 exists ONLY as .claude/teams/session-58a99d14 and .claude/tasks/session-58a99d14.
+// It is a harness-internal uuid with no CLI-side representative. So the transcript resolver
+// computes teams/session-1ae1f671, which does not exist, and returns null at the config read
+// — ALWAYS, on every boot. It is not "unreliable", it is inert by construction, and every
+// consumer has therefore been silently running on the freshness fallback that this guard was
+// written to replace.
+//
+// THE REPLACEMENT: correlate the team's config.createdAt with the RUNNING orchestrator's
+// process start time. The harness stamps createdAt when it creates the team, ~0.6-1.5s after
+// the process starts (measured live 2026-08-26 and 2026-08-28); every team belonging to a
+// PREVIOUS session is necessarily older than THIS process's start, by hours to months.
+//
+// ⚠️ THE RISK THAT GOVERNS THIS CODE. Today the transcript resolver is FAIL-SAFE: it always
+// returns null and freshness scoring happens to be right. A resolver that returns a WRONG dir
+// pins BOTH directions (inbound dashboard/scheduler AND outbound telegram-watcher) to a dead
+// directory — strictly worse than today, and invisible from inside the system. Hence: multiple
+// independent acceptance signals, null-on-ambiguity, and an env flag defaulted OFF.
+
+// Parse macOS `ps -o etime` — format [[dd-]hh:]mm:ss — into milliseconds.
+// macOS `ps` has NO `etimes` keyword: `ps -axo etimes=` fails with
+// "ps: etimes: keyword not found", so elapsed time MUST be parsed from this human format.
+// (`lstart` is also available but is locale-sensitive, so it is not used.)
+export function parseEtimeMs(etime) {
+  const m = /^(?:(?:(\d+)-)?(\d+):)?(\d{1,2}):(\d{2})$/.exec(String(etime).trim())
+  if (!m) return null
+  const days = Number(m[1] || 0)
+  const hours = Number(m[2] || 0)
+  const mins = Number(m[3])
+  const secs = Number(m[4])
+  return ((((days * 24 + hours) * 60) + mins) * 60 + secs) * 1000
+}
+
+// Start time (epoch ms) of the RUNNING orchestrator, or null if none is running.
+// `psRunner` / `nowMs` exist purely as an injection seam: without them this function cannot
+// be tested except against a live orchestrator, which is why the original shipped untested.
+export async function orchestratorProcStartMs({ psRunner = null, nowMs = null } = {}) {
+  const now = nowMs ?? Date.now()
+  let stdout
+  try {
+    stdout = psRunner
+      ? await psRunner()
+      : (await pexecFile('ps', ['-axo', 'pid=,etime=,command='], { maxBuffer: 64 * 1024 * 1024 })).stdout
+  } catch {
+    return null
+  }
+  let newest = null
+  for (const line of String(stdout).split('\n')) {
+    if (!ORCH_ARGV_RE.test(line)) continue
+    const m = /^\s*(\d+)\s+(\S+)\s+(.*)$/.exec(line)
+    if (!m) continue
+    const elapsed = parseEtimeMs(m[2])
+    if (elapsed === null) continue
+    const startMs = now - elapsed
+    // Watchdog relaunch overlap can show two orchestrators briefly. Take the NEWEST: the
+    // older one's team is about to be abandoned, and pinning to it is the outage shape.
+    if (newest === null || startMs > newest) newest = startMs
+  }
+  return newest
+}
+
+// How far BEFORE the process start a team's createdAt may sit and still be accepted.
+// Slack for clock granularity only — the real separation between the live team and every
+// dead one is hours-to-months, so this bound is not load-bearing at its exact value.
+export const LIVE_TEAM_PROC_START_TOLERANCE_MS = 120_000
+
+// GROUND TRUTH: the live orchestrator's team dir, resolved by correlating team
+// config.createdAt with the running orchestrator's process start. Returns null when the
+// orchestrator is down, when no team qualifies (the genuine team-not-created-yet window),
+// or when the answer is AMBIGUOUS — in every one of those cases the caller falls back to
+// freshness scoring. Returning null is always safe; returning a wrong dir is not.
+export async function liveOrchestratorTeamDirByProcStart(teamsDir, { psRunner = null, nowMs = null } = {}) {
+  const procStart = await orchestratorProcStartMs({ psRunner, nowMs })
+  if (procStart === null) return null // orchestrator not running
+
+  let entries = []
+  try {
+    entries = await readdir(teamsDir)
+  } catch {
+    return null
+  }
+
+  const candidates = []
+  for (const name of entries) {
+    const teamDir = join(teamsDir, name)
+    let cfg
+    try {
+      cfg = JSON.parse(await readFile(join(teamDir, 'config.json'), 'utf-8'))
+    } catch {
+      continue // not a registered team (or unreadable/corrupt config)
+    }
+    if (!cfg || typeof cfg !== 'object') continue
+    // Every clause must hold. These are INDEPENDENT signals, not restatements of one:
+    // - name/basename agreement rejects a config.json symlinked in from another team
+    //   (the band-aid-symlink failure mode this module already guards against elsewhere).
+    // - leadAgentId ties the dir to its own lead, so a hand-copied config cannot qualify.
+    // - createdAt vs process start is what actually separates live from dead.
+    if (cfg.name !== basename(teamDir)) continue
+    if (cfg.leadAgentId !== 'team-lead@' + cfg.name) continue
+    if (typeof cfg.createdAt !== 'number') continue
+    // No UPPER bound is applied, deliberately: a session may not create its team until it
+    // first uses teams, so "createdAt is much later than process start" is legitimate. It is
+    // safe because we correlate against the NEWEST running orchestrator — nothing else on
+    // the machine creates team dirs, so a team newer than that instant is necessarily its own.
+    if (cfg.createdAt < procStart - LIVE_TEAM_PROC_START_TOLERANCE_MS) continue
+    candidates.push(teamDir)
+  }
+
+  // Exactly one, or nothing. An ambiguous answer must never be guessed — see the risk note.
+  return candidates.length === 1 ? candidates[0] : null
+}
+
+// LEGACY, INERT: kept only so the regression test can assert that the proc-start resolver
+// does NOT agree with it on a fixture where the two id spaces differ. Do not call this for
+// routing. See the "SESSION IDENTITY" block above for the measurement.
+export async function liveOrchestratorTeamDirByTranscript(teamsDir) {
   try {
     const { stdout } = await pexecFile('ps', ['-axo', 'command='], { maxBuffer: 64 * 1024 * 1024 })
     if (!stdout.split('\n').some((l) => ORCH_ARGV_RE.test(l))) return null
@@ -78,6 +196,25 @@ export async function liveOrchestratorTeamDir(teamsDir) {
   }
 }
 
+// Env flag gating the proc-start resolver. Defaults OFF so that landing this change is a
+// PROVABLE no-op on the running system: with the flag unset, liveOrchestratorTeamDir behaves
+// exactly as it did before (returns null, callers fall back to freshness scoring). Flip it on
+// for one canary cycle, confirm a MATCHED canary ack, then change this default.
+export const LIVE_TEAM_PROC_START_ENV = 'SUPERBOT2_LIVE_TEAM_BY_PROC_START'
+
+export function procStartResolverEnabled(env = process.env) {
+  const v = env?.[LIVE_TEAM_PROC_START_ENV]
+  return v === '1' || v === 'true' || v === 'yes'
+}
+
+// Ground-truth live team dir, or null (caller falls back to freshness scoring).
+export async function liveOrchestratorTeamDir(teamsDir, { env, psRunner = null, nowMs = null } = {}) {
+  if (procStartResolverEnabled(env)) {
+    return liveOrchestratorTeamDirByProcStart(teamsDir, { psRunner, nowMs })
+  }
+  return liveOrchestratorTeamDirByTranscript(teamsDir)
+}
+
 // mtime (ms) of a REAL (non-symlink) file, else null.
 export async function realFileMtimeMs(filePath) {
   try {
@@ -100,9 +237,10 @@ export async function realFileMtimeMs(filePath) {
 //   counting it is circular: a dead team keeps looking fresh precisely because of the
 //   misdelivered messages we're trying to move out of it. Those callers pass false and
 //   score only lead-authored signals (config.json, inboxes/dashboard-user.json).
+// - `env` / `psRunner` / `nowMs`: injection seam forwarded to liveOrchestratorTeamDir.
 // Among teams with a real config.json, pick the one whose activity is freshest, scored by
 // the max mtime of {config.json, inboxes/dashboard-user.json[, inboxes/team-lead.json]}.
-export async function resolveActiveTeamInboxesDir(teamsDir, { pinnedTeam = '', fallbackInboxesDir = null, scoreLeadInbox = true } = {}) {
+export async function resolveActiveTeamInboxesDir(teamsDir, { pinnedTeam = '', fallbackInboxesDir = null, scoreLeadInbox = true, env, psRunner = null, nowMs = null } = {}) {
   if (pinnedTeam && pinnedTeam !== 'superbot2') {
     return join(teamsDir, pinnedTeam, 'inboxes')
   }
@@ -110,7 +248,7 @@ export async function resolveActiveTeamInboxesDir(teamsDir, { pinnedTeam = '', f
   // Ground truth first: the RUNNING orchestrator's own team (see liveOrchestratorTeamDir).
   // Only honored when that team dir exists under THIS teamsDir — so isolated test homes
   // (whose teamsDir never contains the dev machine's real session team) are unaffected.
-  const liveDir = await liveOrchestratorTeamDir(teamsDir)
+  const liveDir = await liveOrchestratorTeamDir(teamsDir, { env, psRunner, nowMs })
   if (liveDir) return join(liveDir, 'inboxes')
 
   let teamDirs = []

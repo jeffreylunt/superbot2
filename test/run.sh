@@ -52,6 +52,7 @@ run_suite "unit (node) tests" \
   node --test --test-concurrency=1 \
   "$DIR/relay-filter.test.mjs" \
   "$DIR/active-team-inbox.test.mjs" \
+  "$DIR/live-team-dir-proc-start.test.mjs" \
   "$DIR/ensure-dashboard-user.test.mjs" \
   "$DIR/inbound-message-write.test.mjs" \
   "$DIR/orchestrator-wake-nudge.test.mjs" \
