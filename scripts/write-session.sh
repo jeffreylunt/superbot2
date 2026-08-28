@@ -45,7 +45,17 @@ mkdir -p "$SESSIONS_DIR"
 
 TIMESTAMP=$(date -u +%Y-%m-%dT%H-%M-%SZ)
 ISO_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-FILE="$SESSIONS_DIR/session-${TIMESTAMP}.json"
+# Collision guard: the filename has SECOND resolution, so two summaries written in the
+# same second silently overwrote each other (hit live 2026-08-24 — two workers' summaries
+# batched into one command, the first was lost with no warning). Suffix instead.
+SESSION_ID="session-${TIMESTAMP}"
+FILE="$SESSIONS_DIR/${SESSION_ID}.json"
+_n=1
+while [[ -e "$FILE" ]]; do
+  SESSION_ID="session-${TIMESTAMP}-${_n}"
+  FILE="$SESSIONS_DIR/${SESSION_ID}.json"
+  _n=$((_n+1))
+done
 
 # Build files array
 if [[ -n "$FILES" ]]; then
@@ -55,7 +65,7 @@ else
 fi
 
 jq -n \
-  --arg id "session-${TIMESTAMP}" \
+  --arg id "$SESSION_ID" \
   --arg space "$SPACE" \
   --arg project "$PROJECT" \
   --arg summary "$SUMMARY" \
