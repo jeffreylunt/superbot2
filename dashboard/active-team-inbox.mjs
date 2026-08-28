@@ -52,6 +52,27 @@ const ORCH_ARGV_RE = /claude --system-prompt( # Superbot2 Orchestrator|-file .*\
 // consumer has therefore been silently running on the freshness fallback that this guard was
 // written to replace.
 //
+// ⛔ TWO ROUTES THAT LOOK OBVIOUS AND ARE BOTH DEAD. Do not re-attempt either; both were
+// proposed and measured on 2026-08-28.
+//
+//   (a) "Read --session-id off ps instead of the transcript filename." The comment that used
+//       to live here claimed the argv TAIL is truncated away by ps and is therefore not
+//       recoverable. THAT CLAIM IS FALSE: `ps -axo command=` prints the full argv including
+//       --session-id. But recovering the session id more reliably fixes NOTHING, because no
+//       team dir is named from the session id. It is the same id space as the transcript
+//       filename. A better source for the wrong key is still the wrong key.
+//
+//   (b) "Match config.leadSessionId against the orchestrator's --session-id." leadSessionId
+//       is SELF-REFERENTIAL: across all 12 team dirs it is always just the dir's own uuid8
+//       expanded (session-58a99d14 -> 58a99d14-5984-…). It is not a pointer at the CLI
+//       session and never matches --session-id. Verified on every team dir, no exceptions.
+//
+// So no CLI-side identifier can name the team, and no field on disk links the two. Rather
+// than CREATE a link (e.g. having the orchestrator stamp a marker file into its team dir at
+// boot — which needs a boot-path change, cannot help the already-running session, and adds a
+// new stale/missing-marker failure mode), we correlate on a value both sides already have:
+// TIME.
+//
 // THE REPLACEMENT: correlate the team's config.createdAt with the RUNNING orchestrator's
 // process start time. The harness stamps createdAt when it creates the team, ~0.6-1.5s after
 // the process starts (measured live 2026-08-26 and 2026-08-28); every team belonging to a
