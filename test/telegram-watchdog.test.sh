@@ -114,7 +114,12 @@ echo "Test B: stale outbound heartbeat triggers loud log + restart"
 make_env
 echo '{"telegram":{"enabled":true,"botToken":"x"}}' > "$TMP/config.json"
 start_watchdog
-wait_for 20 count_at_least 1 || true   # watcher must be up before we stall its outbound HB
+# Assert the launch rather than swallowing it. If the watcher never came up, BEFORE would
+# sample 0 and the FINAL count_above check could then pass on the watcher's first-ever
+# launch instead of on a stall-triggered restart — a pass for the wrong reason, in the one
+# test whose job is to detect a missing restart.
+wait_for 20 count_at_least 1 \
+  && ok "watcher up before stall (count=$(count))" || bad "watcher never launched — Test B preconditions not met"
 BEFORE="$(count)"
 touch "$TMP/stall-outbound"   # watcher keeps inbound HB fresh, stops outbound HB
 wait_for 30 log_has "OUTBOUND relay STALLED" \

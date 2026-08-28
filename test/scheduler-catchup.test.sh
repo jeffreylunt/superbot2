@@ -34,8 +34,22 @@ bad() { echo "  ✗ $1"; FAIL=$((FAIL+1)); }
 
 NOW_MINUTES=$(( 10#$(date +%H) * 60 + 10#$(date +%M) ))
 
-# HH:MM offset minutes from now (BSD date). e.g. t_offset -5  → 5 min ago.
-t_offset() { date -v"${1}M" '+%H:%M'; }
+# HH:MM offset minutes from now (BSD date). e.g. t_offset -5 → 5 min ago, t_offset 45 → in 45 min.
+#
+# The '+' is NOT optional and must be supplied here: BSD `date -v45M` (unsigned) SETS the
+# minute-of-hour to 45 instead of ADDING 45 minutes. Test 3 called `t_offset 45` and so asked
+# for HH:45 — which is in the PAST whenever the current minute is past 45, i.e. for 14 minutes
+# of every hour. "A future slot does not fire" therefore failed ~23% of runs; caught 2026-08-27
+# at 18:58 local, where t_offset 45 returned 18:45 and the scheduler correctly fired it as
+# overdue. Normalise an unsigned argument to an explicit '+' so the call sites can't reintroduce it.
+t_offset() {
+  local off="$1"
+  case "$off" in
+    -*|+*) ;;
+    *) off="+$off" ;;
+  esac
+  date -v"${off}M" '+%H:%M'
+}
 
 make_home() {
   TMP="$(mktemp -d)"
@@ -65,6 +79,13 @@ cleanup()       { rm -rf "$TMP"; }
 
 MIDNIGHT_SKIP=0
 if (( NOW_MINUTES < 95 )); then MIDNIGHT_SKIP=1; fi  # need ~90 min of past room
+
+# Test 3 is the mirror image: it needs ~45 min of FUTURE room left today. Once t_offset
+# genuinely ADDS minutes (see the note on t_offset), now+45 near midnight wraps to e.g.
+# 00:20, which reads as an overdue slot for TODAY and fires — a real pass for the scheduler,
+# a false failure for the test. Skip that window rather than assert something untrue.
+ENDOFDAY_SKIP=0
+if (( NOW_MINUTES > 1440 - 50 )); then ENDOFDAY_SKIP=1; fi
 
 # ── Test 1: a missed task job is caught up and fired exactly once ──────────────────
 echo "Test 1: catch-up fires a missed (overdue, unfired) task job once"
@@ -107,15 +128,19 @@ fi
 
 # ── Test 3: a future slot today is NOT fired ──────────────────────────────────────
 echo "Test 3: a slot still in the future today does not fire"
-make_home
-FUT="$(t_offset 45)"
-write_schedule <<EOF
+if (( ENDOFDAY_SKIP )); then
+  echo "  ⏭  skipped (too close to midnight — no future room left today)"
+else
+  make_home
+  FUT="$(t_offset +45)"
+  write_schedule <<EOF
 [{"name":"future-job","time":"$FUT","task":"later"}]
 EOF
-run_sched
-[[ "$(job_msg_count future-job)" == "0" ]] && ok "future slot not fired" || bad "future slot fired ($(job_msg_count future-job) msgs)"
-lastrun_has "future-job:$(date +%Y-%m-%d)T$FUT" && bad "future slot wrongly marked" || ok "future slot not marked"
-cleanup
+  run_sched
+  [[ "$(job_msg_count future-job)" == "0" ]] && ok "future slot not fired" || bad "future slot fired ($(job_msg_count future-job) msgs)"
+  lastrun_has "future-job:$(date +%Y-%m-%d)T$FUT" && bad "future slot wrongly marked" || ok "future slot not marked"
+  cleanup
+fi
 
 # ── Test 4: dedup — a caught-up job does not re-fire on the next tick ──────────────
 echo "Test 4: dedup — running twice does not re-fire an already-caught-up job"
