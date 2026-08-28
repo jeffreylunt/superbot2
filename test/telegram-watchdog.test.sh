@@ -64,16 +64,48 @@ stop_watchdog() {
 
 count() { cat "$COUNTER" 2>/dev/null; }
 
+# ── De-flaking Tests A and B (2026-08-27) ───────────────────────────────────────
+# Both tests assert on a watcher RESTART, and both used a FIXED sleep sized to the
+# happy path. Test B slept 7s. The real end-to-end restart latency, measured over 6
+# runs on an idle machine, is 6.42s–7.47s — so 2 of 6 runs overran the window and the
+# suite reported a spurious "NOT restarted on outbound stall (count=1)" while the
+# companion "logged outbound stall loudly" assertion (which fires ~2.1s earlier)
+# passed. That is exactly the failure seen on 2026-08-27.
+#
+# Root cause of the ~1s spread that straddles the boundary: heartbeat_age_s computes
+#   (date +%s * 1000 - <epoch-ms heartbeat>) / 1000
+# which truncates "now" to the whole second while the heartbeat carries milliseconds.
+# So a stall crosses the strict `-gt 3` test anywhere from 4.0s to 5.0s after the last
+# outbound write, depending only on where in the wall-clock second the stall began.
+# The rest of the latency is fixed and unavoidable: up to 1s of poll interval, up to 1s
+# in kill_watcher's 1-second-granularity wait loop, the 1s restart backoff, plus node
+# startup — about 2.1s. Worst case ~7.5s against a 7s window.
+#
+# Fix: wait for the CONDITION with a generous ceiling instead of sleeping a fixed
+# amount. That removes the timing sensitivity rather than moving the boundary, and it
+# also makes the tests finish sooner in the common case.
+wait_for() {
+  local timeout="$1"; shift
+  local deadline=$((SECONDS + timeout))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    "$@" && return 0
+    sleep 0.2
+  done
+  return 1
+}
+count_at_least() { [ "$(count)" -ge "$1" ]; }
+count_above()    { [ "$(count)" -gt "$1" ]; }
+log_has()        { grep -q "$1" "$TMP/logs/telegram-watcher.log" 2>/dev/null; }
+
 # --- Test A: restart-while-enabled (clean exit 0 still restarts) ---
 echo "Test A: watcher exit 0 is restarted while telegram enabled"
 make_env
 echo '{"telegram":{"enabled":true,"botToken":"x"}}' > "$TMP/config.json"
 start_watchdog
-sleep 3
-[ "$(count)" -ge 1 ] && ok "watcher launched (count=$(count))" || bad "watcher never launched"
+wait_for 20 count_at_least 1 && ok "watcher launched (count=$(count))" || bad "watcher never launched"
 touch "$TMP/die"      # cause a clean exit 0
-sleep 4               # allow detect + backoff(1s) + relaunch
-[ "$(count)" -ge 2 ] && ok "watcher restarted after exit 0 (count=$(count))" || bad "NOT restarted after exit 0 (count=$(count))"
+wait_for 25 count_at_least 2 \
+  && ok "watcher restarted after exit 0 (count=$(count))" || bad "NOT restarted after exit 0 (count=$(count))"
 stop_watchdog
 rm -rf "$TMP"
 
@@ -82,13 +114,16 @@ echo "Test B: stale outbound heartbeat triggers loud log + restart"
 make_env
 echo '{"telegram":{"enabled":true,"botToken":"x"}}' > "$TMP/config.json"
 start_watchdog
-sleep 3
+wait_for 20 count_at_least 1 || true   # watcher must be up before we stall its outbound HB
 BEFORE="$(count)"
 touch "$TMP/stall-outbound"   # watcher keeps inbound HB fresh, stops outbound HB
-sleep 7                        # > OUTBOUND_STALE_THRESHOLD(3) + check interval + restart
+wait_for 30 log_has "OUTBOUND relay STALLED" \
+  && ok "logged outbound stall loudly" || bad "no loud outbound-stall log"
+# Safe to clear only AFTER detection: clearing earlier lets the outbound HB refresh and
+# no stall is ever detected. The kill+relaunch is already committed at this point.
 rm -f "$TMP/stall-outbound"
-grep -q "OUTBOUND relay STALLED" "$TMP/logs/telegram-watcher.log" && ok "logged outbound stall loudly" || bad "no loud outbound-stall log"
-[ "$(count)" -gt "$BEFORE" ] && ok "watcher restarted on outbound stall (count=$(count) > $BEFORE)" || bad "NOT restarted on outbound stall (count=$(count))"
+wait_for 30 count_above "$BEFORE" \
+  && ok "watcher restarted on outbound stall (count=$(count) > $BEFORE)" || bad "NOT restarted on outbound stall (count=$(count))"
 stop_watchdog
 rm -rf "$TMP"
 
