@@ -46,6 +46,7 @@ run_suite "dashboard orphan-reaper (bash) tests"      bash "$DIR/dashboard-reape
 run_suite "heartbeat rotation-proofing (bash) tests"  bash "$DIR/heartbeat-rotation.test.sh"
 run_suite "scheduler catch-up + self-guard (bash) tests" bash "$DIR/scheduler-catchup.test.sh"
 run_suite "update-task.sh notes safety (bash) tests"  bash "$DIR/update-task-notes.test.sh"
+run_suite "write-session.sh collision handling (bash) tests" bash "$DIR/write-session-concurrency.test.sh"
 
 run_suite "unit (node) tests" \
   node --test --test-concurrency=1 \
